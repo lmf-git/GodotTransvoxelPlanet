@@ -31,6 +31,8 @@ extends Node3D
 
 @export var planet_radius     : float = 4000.0
 @export var atmosphere_radius : float = 4520.0
+@export var cloud_inner_radius : float = 4180.0   # bottom of the volumetric cloud deck
+@export var cloud_outer_radius : float = 4420.0   # top of the deck (inside the atmosphere shell)
 @export var sea_level_offset  : float = -12.0     # world units (negative = below planet_radius)
 @export var world_seed        : int   = 1337
 
@@ -69,8 +71,10 @@ var planet_system : Node3D
 var planet        : Planet
 var atmosphere    : MeshInstance3D
 var water         : MeshInstance3D
+var clouds        : MeshInstance3D
 var atmosphere_mat: ShaderMaterial
 var water_mat     : ShaderMaterial
+var cloud_mat     : ShaderMaterial
 var terrain_mat   : ShaderMaterial
 var world_env     : WorldEnvironment
 var moon_system   : Node3D
@@ -103,6 +107,14 @@ var _origin_offset_z : float = 0.0
 
 func world_origin_offset() -> Vector3:
 	return Vector3(_origin_offset_x, _origin_offset_y, _origin_offset_z)
+
+
+# Show/hide the volumetric cloud deck. Returns the new visibility state.
+func toggle_clouds() -> bool:
+	if clouds:
+		clouds.visible = not clouds.visible
+		return clouds.visible
+	return false
 
 
 func _ready() -> void:
@@ -283,7 +295,7 @@ func _build_planet_system() -> void:
 	planet.voxel_resolution = 12
 	planet.lod_factor = 2.4
 	planet.collision_lod_max = 1
-	planet.max_new_chunks_per_tick = 4
+	planet.max_new_chunks_per_tick = 16
 	planet.sea_level_offset = sea_level_offset
 	planet.name = "Planet"
 	terrain_mat = ShaderMaterial.new()
@@ -292,8 +304,8 @@ func _build_planet_system() -> void:
 	terrain_mat.set_shader_parameter("planet_radius", planet_radius)
 	terrain_mat.set_shader_parameter("polar_axis", Vector3.UP)
 	terrain_mat.set_shader_parameter("snow_altitude", planet_radius * 0.05)
-	terrain_mat.set_shader_parameter("polar_cap_latitude", 0.62)
-	terrain_mat.set_shader_parameter("polar_cap_fade", 0.18)
+	terrain_mat.set_shader_parameter("polar_cap_latitude", 0.82)
+	terrain_mat.set_shader_parameter("polar_cap_fade", 0.10)
 	terrain_mat.set_shader_parameter("beach_altitude", 8.0)
 	terrain_mat.set_shader_parameter("beach_fade", 14.0)
 	planet.terrain_material = terrain_mat
@@ -320,6 +332,11 @@ func _build_planet_system() -> void:
 	atmosphere_mat.set_shader_parameter("mie_color", Vector3(1.0, 0.85, 0.65))
 	atmosphere_mat.set_shader_parameter("scattering_strength", 1.6)
 	atmosphere_mat.set_shader_parameter("mie_strength", 0.55)
+	# Concentric transparent shells (water < clouds < atmosphere) share the
+	# planet centre, so Godot can't depth-sort them by camera distance and
+	# their draw order flips frame-to-frame (the cloud/atmosphere flicker).
+	# Pin an explicit order: outer shells draw last, over the inner ones.
+	atmosphere_mat.render_priority = 2
 	atmosphere.material_override = atmosphere_mat
 	planet_system.add_child(atmosphere)
 
@@ -341,8 +358,34 @@ func _build_planet_system() -> void:
 	water_mat.set_shader_parameter("planet_center", Vector3.ZERO)
 	water_mat.set_shader_parameter("planet_radius", planet_radius)
 	water_mat.set_shader_parameter("sea_level_offset", sea_level_offset)
+	water_mat.render_priority = 0
 	water.material_override = water_mat
 	planet_system.add_child(water)
+
+	# ── Volumetric cloud deck ───────────────────────────────────────────────
+	# Raymarched shell rendered on a sphere at the deck's outer radius. The
+	# shader clips the view ray to [cloud_inner, cloud_outer] and marches it,
+	# so it works from orbit, inside the deck, or on the ground looking up.
+	clouds = MeshInstance3D.new()
+	clouds.name = "Clouds"
+	var cmesh := SphereMesh.new()
+	cmesh.radius = cloud_outer_radius
+	cmesh.height = cloud_outer_radius * 2.0
+	cmesh.radial_segments = 64
+	cmesh.rings = 32
+	clouds.mesh = cmesh
+	clouds.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	clouds.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	clouds.extra_cull_margin = cloud_outer_radius
+	cloud_mat = ShaderMaterial.new()
+	cloud_mat.shader = load("res://shaders/clouds.gdshader")
+	cloud_mat.set_shader_parameter("planet_center", Vector3.ZERO)
+	cloud_mat.set_shader_parameter("planet_radius", planet_radius)
+	cloud_mat.set_shader_parameter("cloud_inner", cloud_inner_radius)
+	cloud_mat.set_shader_parameter("cloud_outer", cloud_outer_radius)
+	cloud_mat.render_priority = 1
+	clouds.material_override = cloud_mat
+	planet_system.add_child(clouds)
 
 
 func _build_moon() -> void:
@@ -420,6 +463,9 @@ func _update_transforms() -> void:
 	water_mat.set_shader_parameter("sun_direction", sun_to_planet)
 	atmosphere_mat.set_shader_parameter("planet_center", planet_system.global_position)
 	water_mat.set_shader_parameter("planet_center", planet_system.global_position)
+	if cloud_mat:
+		cloud_mat.set_shader_parameter("sun_direction", sun_to_planet)
+		cloud_mat.set_shader_parameter("planet_center", planet_system.global_position)
 
 	# Moon — orbits the planet at moon_orbit_radius, inclined out of the
 	# orbital plane by moon_inclination_deg. Computed in doubles so the

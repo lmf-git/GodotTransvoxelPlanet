@@ -18,7 +18,7 @@ extends Node3D
 ##
 ## Spawn and free are both throttled per-tick so the main thread never stalls.
 
-signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int)
+signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, lod_violations: int)
 
 @export var planet_radius : float = 4000.0
 @export var world_seed    : int   = 1337
@@ -29,8 +29,9 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int)
 @export var collision_lod_max : int = 1          # build collision for chunks at this LOD or below
 @export var scatter_lod_max : int = 1            # scatter props (rocks) on chunks at this LOD or below
 @export var sea_level_offset : float = -12.0     # passed to scatter so it skips submerged triangles
-@export var max_new_chunks_per_tick  : int = 4
-@export var max_free_chunks_per_tick : int = 8
+@export var max_new_chunks_per_tick  : int = 16
+@export var max_remesh_per_tick      : int = 8   # neighbour-mask re-meshes (own budget so they can't starve initial load)
+@export var max_free_chunks_per_tick : int = 16
 @export var stale_tolerance : int = 30           # frames a chunk can be unvisited before free
 @export var terrain_material : Material
 
@@ -50,8 +51,9 @@ var density : Variant
 # mesher all operate in the planet's local frame.
 var planet_center : Vector3 = Vector3.ZERO
 
-var _chunks       : Dictionary = {}   # key (String) → ChunkRecord
-var _pending_load : Array      = []   # keys queued to mesh
+var _chunks        : Dictionary = {}   # key (String) → ChunkRecord
+var _pending_load  : Array      = []   # keys queued for their FIRST mesh
+var _pending_remesh: Array      = []   # keys queued to re-mesh after a neighbour-LOD mask change
 var _generation   : int        = 0
 var _camera       : Camera3D
 var _total_tris   : int        = 0
@@ -113,14 +115,19 @@ func _process(_dt: float) -> void:
 	var cam_local := to_local(_camera.global_position)
 	_traverse_root(cam_local)
 	_collect_stale_chunks()
-	# (Balance is now enforced inline inside `_visit_node` via
-	# `_balance_requires_subdivide`, so we don't need a separate post-pass
-	# here. The old `_enforce_octree_balance` is kept below as a defence-
-	# in-depth net but should normally be a no-op now.)
-	_enforce_octree_balance()
+	# Balance is enforced INLINE during traversal (`_balance_requires_subdivide`
+	# with the exact closest-point test), which produces an already-2:1 octree
+	# as a pure function of camera position — stable frame-to-frame. The old
+	# post-pass `_enforce_octree_balance` is intentionally NOT called: it relied
+	# on `_split_chunk`, which freed a coarse chunk's mesh BEFORE its finer
+	# replacements were built (a "chunks disappear" hole), and with the inline
+	# check correct it has nothing to fix. The HUD's "2:1 violations" readout
+	# verifies the inline check is holding; if it ever reads non-zero we fix the
+	# inline check rather than papering over it with hole-punching splits.
 	_update_neighbor_masks()
 	_drain_pending_load()
-	stats_changed.emit(_chunks.size(), _pending_load.size(), _total_tris)
+	stats_changed.emit(_chunks.size(), _pending_load.size() + _pending_remesh.size(),
+			_total_tris, _count_balance_violations())
 
 
 func _traverse_root(cam_pos: Vector3) -> void:
@@ -133,11 +140,17 @@ func _traverse_root(cam_pos: Vector3) -> void:
 				var origin := Vector3(ix, iy, iz) * root_size
 				if not _aabb_intersects_planet(origin, root_size):
 					continue
+				var root_center := origin + Vector3(root_size, root_size, root_size) * 0.5
+				if _node_beyond_horizon(root_center, root_size, cam_pos):
+					continue
 				_visit_node(max_lod, Vector3i(ix, iy, iz), origin, root_size, cam_pos)
 
 
 func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_pos: Vector3) -> void:
 	var center := origin + Vector3(size, size, size) * 0.5
+	# Drop the whole subtree if it's behind the planet's horizon.
+	if _node_beyond_horizon(center, size, cam_pos):
+		return
 	var dist := cam_pos.distance_to(center)
 	var subdivide := lod > 0 and dist < size * lod_factor
 
@@ -172,55 +185,48 @@ func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_p
 	rec.last_seen = _generation
 
 
-# Returns true if any of the 6 face-adjacent positions of a chunk at `lod`
-# with the given center/size would be inside a leaf at LOD ≤ lod - 2 (a 2:1
-# violation). We don't inspect `_chunks` because traversal might not have
-# visited the adjacent subtree yet; instead we replicate the subdivision
-# decision an octree walk would make at each face-adjacent POSITION.
-# Returning true cascades naturally — children at lod-1 run the same check.
+# Returns true if any of the 26 neighbours (6 faces + 12 edges + 8 corners) of
+# a chunk at `lod` would be a leaf at LOD ≤ lod - 2 (a 2:1 violation). This is
+# the FULL octree restriction, not just face restriction: the radial LOD
+# frontier cuts diagonally across the cubic chunk grid, so the worst seams are
+# at cells that meet only along an edge or corner — a face-only check leaves
+# those free to differ by 2+ LODs. We don't inspect `_chunks` (traversal may
+# not have visited the adjacent subtree yet); instead we replicate the octree's
+# subdivision decision at the neighbour POSITION. Returning true cascades — each
+# lod-1 child runs the same check, so a cell next to a finer region steps down
+# until balanced.
 #
-# We use TWO sample points per face to catch the realistic worst case:
-# the face centre (camera roughly perpendicular to the chunk) and a corner
-# of the face (camera at a grazing angle, which is what makes the nearest
-# face-adjacent leaf much smaller than the face centre would suggest —
-# the original failure mode that produced the "4 nearest chunks 2 LODs
-# above their neighbours" report).
+# Per neighbour we test the point of its cell nearest the camera. Leaf-LOD is
+# monotonic in camera distance (closer = finer), so that single point carries
+# the finest leaf-LOD in the neighbour and is the exact binding 2:1 constraint.
 func _balance_requires_subdivide(
 		lod: int, center: Vector3, size: float, cam_pos: Vector3) -> bool:
 	var half := size * 0.5
-	# Each entry is [axis, sign]. The 6 entries cover the 6 faces; for each
-	# face we test the centre and the four corners (5 points × 6 faces =
-	# 30 samples). 30 ancestor walks per chunk per frame is still cheap.
-	var face_dirs : Array = [
-		[0, -1], [0, 1], [1, -1], [1, 1], [2, -1], [2, 1],
-	]
 	var threshold_floor := lod - 2
-	for fd in face_dirs:
-		var axis : int = fd[0]
-		var sign_ : int = fd[1]
-		# Build a point just beyond the face in the outward direction. We
-		# step half-a-voxel past the face plane so the sample lands inside
-		# the face-adjacent cell, not on the boundary plane itself.
-		var nudge := size * 0.01
-		var face_offset := Vector3.ZERO
-		face_offset[axis] = float(sign_) * (half + nudge)
-		# Centre of the face, plus the 4 corners.
-		var u_axis := (axis + 1) % 3
-		var v_axis := (axis + 2) % 3
-		var samples : Array = []
-		samples.append(Vector3.ZERO)             # centre
-		samples.append(Vector3.ZERO)
-		samples.append(Vector3.ZERO)
-		samples.append(Vector3.ZERO)
-		samples.append(Vector3.ZERO)
-		samples[1][u_axis] = -half; samples[1][v_axis] = -half
-		samples[2][u_axis] =  half; samples[2][v_axis] = -half
-		samples[3][u_axis] = -half; samples[3][v_axis] =  half
-		samples[4][u_axis] =  half; samples[4][v_axis] =  half
-		for s in samples:
-			var nbr_pos : Vector3 = center + face_offset + s
-			if _leaf_lod_at_position(nbr_pos, cam_pos) <= threshold_floor:
-				return true
+	var nudge := size * 0.01
+	for dx in [-1, 0, 1]:
+		for dy in [-1, 0, 1]:
+			for dz in [-1, 0, 1]:
+				if dx == 0 and dy == 0 and dz == 0:
+					continue
+				var d := Vector3i(dx, dy, dz)
+				# Skip neighbours holding no terrain — nothing there to mismatch,
+				# and forcing a split would just burn chunks toward empty space.
+				var nbr_center := center + Vector3(dx, dy, dz) * size
+				if not _aabb_intersects_planet(nbr_center - Vector3(half, half, half), size):
+					continue
+				# Closest point of the neighbour cell to the camera: on each axis
+				# the cell shares (d==0) we clamp the camera coord to our extent;
+				# on each axis it's offset (d!=0) we sit just past that boundary.
+				var p := Vector3.ZERO
+				for axis in 3:
+					var dd : int = d[axis]
+					if dd != 0:
+						p[axis] = center[axis] + float(dd) * (half + nudge)
+					else:
+						p[axis] = clampf(cam_pos[axis], center[axis] - half, center[axis] + half)
+				if _leaf_lod_at_position(p, cam_pos) <= threshold_floor:
+					return true
 	return false
 
 
@@ -395,6 +401,26 @@ func _enforce_octree_balance() -> void:
 # until we find an active chunk in `_chunks`, or run out of levels. Returns
 # the active chunk record, or null if no chunk covers that neighbour cell.
 # O(max_lod) lookups per call.
+# Diagnostic: count face-adjacent chunk pairs whose LOD differs by ≥ 2 (a
+# broken 2:1 restriction). Transvoxel transition cells can only stitch a 1-LOD
+# step, so any nonzero count here is a real source of boundary gaps. This is
+# computed AFTER the balance passes, so it reflects the final structural state
+# each frame — if it reads 0 but seams still show, the seams are in the
+# transition-cell mesh itself, not the LOD layout; if it reads > 0, the balance
+# is genuinely failing. Surfaced on the HUD so we can tell which is which.
+func _count_balance_violations() -> int:
+	var count := 0
+	for key in _chunks.keys():
+		var rec : ChunkRecord = _chunks[key]
+		for face_bit in 6:
+			var nbr := _coarsest_face_neighbour(rec, face_bit)
+			if nbr == null:
+				continue
+			if absi(nbr.lod - rec.lod) >= 2:
+				count += 1
+	return count
+
+
 func _coarsest_face_neighbour(rec: ChunkRecord, face_bit: int) -> ChunkRecord:
 	var delta := Vector3i.ZERO
 	match face_bit:
@@ -462,10 +488,13 @@ func _update_neighbor_masks() -> void:
 		var new_mask := _compute_coarser_mask(rec.lod, rec.coords)
 		if rec.chunk and rec.chunk.set_coarser_mask(new_mask):
 			rec.coarser_mask = new_mask
-			# Re-queue. request_build is a no-op while a task is still in
-			# flight, so we use the pending queue to throttle re-mesh waves.
-			if not _pending_load.has(key):
-				_pending_load.append(key)
+			# Re-queue on the LOW-PRIORITY re-mesh queue. request_build is a
+			# no-op while a task is still in flight, so the queue throttles
+			# re-mesh waves; deferring behind initial loads also lets a burst
+			# of transient mask flips (neighbours streaming in one-by-one)
+			# collapse into a single re-mesh once the frontier settles.
+			if not _pending_remesh.has(key):
+				_pending_remesh.append(key)
 
 
 # For chunk at (lod, coords), check each of 6 face directions: is the
@@ -512,16 +541,30 @@ func _compute_coarser_mask(lod: int, coords: Vector3i) -> int:
 
 
 func _drain_pending_load() -> void:
-	var n := mini(max_new_chunks_per_tick, _pending_load.size())
-	for i in n:
+	# Initial meshes first — getting *some* surface in front of the player
+	# everywhere beats perfecting seams on already-covered chunks. The stale
+	# skips don't consume budget, so a frame's whole budget goes to real work.
+	var dispatched := 0
+	while dispatched < max_new_chunks_per_tick and not _pending_load.is_empty():
 		var key : String = _pending_load.pop_front()
 		if not _chunks.has(key):
 			continue
 		var rec : ChunkRecord = _chunks[key]
-		# Skip if went stale before we got to it.
 		if (_generation - rec.last_seen) > stale_tolerance:
 			continue
 		rec.chunk.request_build()
+		dispatched += 1
+	# Then heal LOD-transition seams on a separate, smaller budget.
+	var remeshed := 0
+	while remeshed < max_remesh_per_tick and not _pending_remesh.is_empty():
+		var rkey : String = _pending_remesh.pop_front()
+		if not _chunks.has(rkey):
+			continue
+		var rrec : ChunkRecord = _chunks[rkey]
+		if (_generation - rrec.last_seen) > stale_tolerance:
+			continue
+		rrec.chunk.request_build()
+		remeshed += 1
 
 
 func _key(lod: int, coords: Vector3i) -> String:
@@ -533,6 +576,33 @@ func _mesh_instance_of(c: VoxelChunk) -> MeshInstance3D:
 		if child is MeshInstance3D:
 			return child
 	return null
+
+
+# Far-side (horizon) culling. A node is skipped only when its entire bounding
+# sphere sits behind the planet's horizon as seen from the camera — i.e. the
+# body itself occludes it regardless of where the camera looks. Near the
+# surface this removes most of the planet (the whole far hemisphere plus the
+# occluded near-horizon band); far-side chunks already built get freed via the
+# normal stale path once traversal stops visiting them.
+func _node_beyond_horizon(center: Vector3, size: float, cam_pos: Vector3) -> bool:
+	var cam_dist := cam_pos.length()
+	var center_dist := center.length()
+	if cam_dist < 1.0 or center_dist < 1.0:
+		return false
+	var cam_dir := cam_pos / cam_dist
+	var node_dir := center / center_dist
+	var ang := acos(clampf(cam_dir.dot(node_dir), -1.0, 1.0))
+	# Visible-cap half-angle = the camera-side horizon of the (mean) body, PLUS
+	# the extra angular reach of the tallest terrain that can peek over that
+	# horizon (so a visible summit is never culled), PLUS the node's own angular
+	# radius, PLUS a small safety pad.
+	var occ_r : float = planet_radius
+	var max_r : float = density.max_surface_radius()
+	var cam_horizon : float = (acos(clampf(occ_r / cam_dist, -1.0, 1.0)) if cam_dist > occ_r else 0.0)
+	var peak_reach : float = acos(clampf(occ_r / max_r, -1.0, 1.0))
+	var node_bound := size * 0.8660254   # half the cube's space-diagonal
+	var node_ang := asin(clampf(node_bound / center_dist, -1.0, 1.0))
+	return ang > cam_horizon + peak_reach + node_ang + 0.05
 
 
 func _aabb_intersects_planet(origin: Vector3, size: float) -> bool:

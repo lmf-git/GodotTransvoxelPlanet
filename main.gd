@@ -28,11 +28,15 @@ func _ready() -> void:
 	player.name = "Player"
 	# Parent to the PlanetSystem so the player travels with the orbit.
 	world.planet_system.add_child(player)
-	# Spawn over the +Y pole, expressed in the PlanetSystem's local frame.
-	player.position = Vector3(0, PLANET_RADIUS + SPAWN_ALTITUDE, 0)
+	# Spawn over the equator on the SUNLIT side. The star is at the world
+	# origin and the planet orbits out toward +X, so the planet's lit hemisphere
+	# faces -X (back toward the sun); the +X face is night. Spawning at -X puts
+	# the player over daylit, varied-biome terrain instead of a dark hemisphere
+	# that reads as empty void. Expressed in the PlanetSystem local frame.
+	player.position = Vector3(-(PLANET_RADIUS + SPAWN_ALTITUDE), 0, 0)
 	# look_at uses GLOBAL coordinates and aims the node's -Z at the target.
-	# Target = planet center (world). Up reference = arbitrary perpendicular.
-	player.look_at(world.planet_system.global_position, Vector3.FORWARD)
+	# Target = planet center. Up = world up (perpendicular to the +X view dir).
+	player.look_at(world.planet_system.global_position, Vector3.UP)
 
 	# Hand the planet reference to the player for gravity/altitude queries.
 	player.set_planet(world.planet)
@@ -62,7 +66,7 @@ func _build_hud() -> void:
 	vbox.add_child(time_label)
 
 	var help := _make_label("")
-	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [`] wireframe  [Esc] release mouse"
+	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [C] clouds  [`] wireframe  [Esc] release mouse"
 	help.modulate = Color(1, 1, 1, 0.75)
 	vbox.add_child(help)
 
@@ -95,12 +99,16 @@ func _input(event: InputEvent) -> void:
 		_wireframe = not _wireframe
 		var debug := Viewport.DEBUG_DRAW_WIREFRAME if _wireframe else Viewport.DEBUG_DRAW_DISABLED
 		get_viewport().debug_draw = debug
+	# [C] toggles the volumetric cloud deck.
+	if event is InputEventKey and event.pressed and not event.echo \
+			and (event as InputEventKey).keycode == KEY_C:
+		world.toggle_clouds()
 
 
-func _on_planet_stats(active: int, pending: int, tris: int) -> void:
+func _on_planet_stats(active: int, pending: int, tris: int, lod_violations: int) -> void:
 	var alt := world.planet.altitude_above_surface(player.global_position)
-	hud_label.text = "Chunks %d (+%d pending)   Tris %s   Altitude %.0f m   Mode %s" % [
-		active, pending, _comma(tris), alt,
+	hud_label.text = "Chunks %d (+%d pending)   Tris %s   2:1 violations %d   Altitude %.0f m   Mode %s" % [
+		active, pending, _comma(tris), lod_violations, alt,
 		"FLIGHT" if player.mode == FlightPlayer.Mode.FLIGHT else "WALK"
 	]
 

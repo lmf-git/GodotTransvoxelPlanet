@@ -188,7 +188,12 @@ func sample(p: Vector3) -> float:
 	# brings the mean back below sea level so water actually rises above the
 	# terrain in continent-noise minima.
 	var continent := _n_continent.get_noise_3dv(ps)        # [-1, 1]
-	continent = continent * 1.05 - 0.12
+	# Push the mean continental height modestly BELOW sea level so ocean basins
+	# form (water sphere sits at planet_radius + sea_level_offset = 12 m below
+	# mean radius) without drowning the whole planet. Combined with mountains
+	# now being a rarer biome (less global positive height), low continents
+	# flood into seas while the highlands stay dry land.
+	continent = continent * 1.1 - 0.15
 
 	# Ridges only over land — mountains rise from the continents.
 	var land_mask := smoothstep(-0.05, 0.35, continent)
@@ -204,8 +209,13 @@ func sample(p: Vector3) -> float:
 		_n_uber_warp.get_noise_3d(p.x + 131.0, p.y - 47.0, p.z + 19.0),
 		_n_uber_warp.get_noise_3d(p.x - 73.0, p.y + 11.0, p.z - 233.0)) * 280.0
 	var region := _n_uber.get_noise_3dv(p + uber_warp_v)   # [-1, 1]
-	var mountain_belt := smoothstep(-0.40, 0.35, region)
-	# Inverse mask — calm rolling hills where the belt is low.
+	# Mountains are now a MINORITY biome, not ~half the land. Raising the
+	# smoothstep window means only the strongest regional peaks (region > ~0.45)
+	# read as full mountains; everything else stays gentle. This is the main
+	# lever against "the whole near side is steep grey rock" — most terrain is
+	# now rolling hills / plains where grass + latitude biomes can show.
+	var mountain_belt := smoothstep(0.10, 0.50, region)
+	# Inverse mask — calm rolling hills cover the wide middle band of `region`.
 	var hill_belt := 1.0 - smoothstep(-0.30, 0.25, region)
 
 	var ridge := absf(_n_ridge.get_noise_3dv(ps))          # [0, 1]
@@ -231,7 +241,9 @@ func sample(p: Vector3) -> float:
 	# (spire | plateau | canyon) and the rest of the surface stays plain.
 	# Land-gating keeps spires from growing out of the ocean.
 	var biome := _n_biome.get_noise_3dv(p + uber_warp_v * 1.7)   # [-1, 1]
-	var spire_mask   := smoothstep(0.40, 0.60, biome) * land_mask
+	# Spires are the single rockiest feature (steep buttes → cliff normals).
+	# Keep them a rare, special-place biome rather than a common one.
+	var spire_mask   := smoothstep(0.55, 0.74, biome) * land_mask
 	var plateau_mask := smoothstep(-0.05, 0.15, biome) * (1.0 - smoothstep(0.30, 0.45, biome)) * land_mask
 	var canyon_mask  := (1.0 - smoothstep(-0.45, -0.25, biome)) * land_mask
 

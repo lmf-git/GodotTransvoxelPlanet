@@ -1,0 +1,21 @@
+[package]
+name = "transvoxel_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# api-custom generates bindings from the running Godot binary (GODOT4_BIN),
+# which is required for a dev build like 4.7.dev3 that the released gdext
+# bindings don't target.
+# Pinned to 0.4.5: gdext 0.5.x references newer GDExtension interface fields
+# (e.g. classdb_construct_object3) that Godot 4.7.dev3 doesn't expose yet.
+# 0.4.5 targets the older interface that this dev build still provides, and
+# api-custom generates the concrete bindings from the running binary.
+godot = { version = "=0.5.2", features = ["api-custom"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -28,8 +28,8 @@ uniform float snow_fade            : hint_range(1.0, 200.0)      = 70.0;
 uniform float equator_warmth       : hint_range(0.0, 1.0)        = 0.65;  // how much to bias equator away from snow
 uniform float beach_altitude       : hint_range(-100.0, 100.0)   = 8.0;
 uniform float beach_fade           : hint_range(0.1, 100.0)      = 14.0;
-uniform float rock_slope_threshold : hint_range(0.0, 1.0)        = 0.40;
-uniform float rock_slope_fade      : hint_range(0.001, 0.5)      = 0.22;
+uniform float rock_slope_threshold : hint_range(0.0, 1.0)        = 0.30;
+uniform float rock_slope_fade      : hint_range(0.001, 0.5)      = 0.18;
 
 uniform vec3 color_grass  : source_color = vec3(0.28, 0.46, 0.18);   // temperate green
 uniform vec3 color_dirt   : source_color = vec3(0.45, 0.33, 0.20);   // arable earth
@@ -51,7 +51,7 @@ uniform float detail_scale_b : hint_range(0.001, 1.0) = 0.25;
 uniform float detail_amp     : hint_range(0.0, 0.5)   = 0.24;
 
 uniform float macro_scale    : hint_range(0.0001, 0.1) = 0.0045;
-uniform float macro_amp      : hint_range(0.0, 1.0)    = 0.55;
+uniform float macro_amp      : hint_range(0.0, 1.0)    = 0.70;
 
 uniform float roughness_base : hint_range(0.0, 1.0) = 0.92;
 uniform float specular_base  : hint_range(0.0, 1.0) = 0.04;
@@ -191,6 +191,14 @@ void fragment() {
 		rock_slope_threshold + rock_slope_fade,
 		slope);
 	vec3 base_albedo = mix(lowland, color_rock, rock_t);
+
+	// Polar caps stay ice-covered even over rock — snow only sheds off the
+	// near-vertical faces. Re-applied AFTER the rock pass (which otherwise
+	// paints every steep polar slope bare grey), so the cap reads as
+	// snow-capped peaks instead of rock. This is what makes the spin-axis
+	// poles actually look like ice caps.
+	float cap_snow = polar_t * smoothstep(0.12, 0.45, slope);
+	base_albedo = mix(base_albedo, color_snow, clamp(cap_snow, 0.0, 1.0));
 
 	// Triplanar detail to break up the surface at close range.
 	base_albedo = triplanar_tinted(base_albedo, wp, wn, detail_scale_a);

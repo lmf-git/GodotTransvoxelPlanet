@@ -217,6 +217,22 @@ static func build(input: Dictionary) -> Dictionary:
 			density,
 			positions, normals, indices)
 
+	# ── 3c. Universal boundary skirts — the "no gaps, ever" guarantee ────────
+	# Transvoxel transition cells only stitch FACE boundaries at a 1-LOD step;
+	# they leave hairline cracks at chunk EDGES and CORNERS (where 3+ chunks of
+	# differing LOD meet) and anywhere the surfaces don't quite line up. We seal
+	# ALL of them geometrically: wherever the iso-surface exits any of the 6
+	# chunk faces, drop a wall radially inward. Adjacent chunks' surfaces can
+	# disagree at the seam, but the wall always backs the boundary with
+	# terrain-shaded geometry, so the background/space can never show through.
+	# (Appended BEFORE the normal-finalise pass so its raw-gradient normals get
+	# the same negate+outward treatment and shade continuously with the surface
+	# — no flat "outline" like the earlier shallow version.)
+	_append_boundary_skirts(
+		positions, normals, indices,
+		d, gs, gs2, resolution, base, voxel, planet_center,
+		grad_x, grad_y, grad_z, cs, cs2)
+
 	# Finalise normals. Stored as raw gradient ∇d during emission. The outward
 	# surface normal is -∇d (density is positive inside the planet, so ∇d
 	# points toward the centre). We then guarantee the orientation by checking
@@ -385,6 +401,104 @@ static func _emit_edge_vertex(
 	positions.append(p)
 	normals.append(n)
 	return positions.size() - 1
+
+
+# Universal boundary skirt. For every cell on each of the 6 chunk faces where
+# the iso-surface crosses, drop a double-sided wall radially inward by a few
+# voxels. This is the unconditional gap seal: it runs on ALL faces (so it
+# covers edge/corner cracks Transvoxel can't, not just coarser-LOD faces), its
+# depth scales with the voxel (so it always exceeds a 2:1 neighbour's surface
+# step), and each wall vertex carries the iso-surface's own interpolated
+# gradient normal (so it shades like the terrain it backs rather than as a flat
+# band). At a matched same-LOD boundary the wall sits hidden behind the
+# coincident surfaces; at a mismatched boundary it fills the daylight.
+#
+# `cps`/`cns` collect the crossing positions and their (raw-gradient) normals;
+# walls are emitted per crossing PAIR (the surface enters and leaves the face
+# cell), so a single line of wall traces the surface's exit from the chunk.
+static func _append_boundary_skirts(
+		positions: PackedVector3Array, normals: PackedVector3Array, indices: PackedInt32Array,
+		d: PackedFloat32Array, gs: int, gs2: int, resolution: int,
+		base: Vector3, voxel: float, planet_center: Vector3,
+		grad_x: PackedFloat32Array, grad_y: PackedFloat32Array, grad_z: PackedFloat32Array,
+		cs: int, cs2: int) -> void:
+	# Deep enough to cover a 2:1 neighbour's worst-case surface step (the coarse
+	# voxel is 2× ours). Tunable: raise if any sky still peeks at a seam.
+	var drop := voxel * 2.5
+	var faces := [
+		[0, 0], [0, resolution], [1, 0], [1, resolution], [2, 0], [2, resolution],
+	]
+	var face_edges := [[0, 1], [1, 3], [3, 2], [2, 0]]
+	for face in faces:
+		var fixed_axis : int = face[0]
+		var fixed_val  : int = face[1]
+		var u_axis := (fixed_axis + 1) % 3
+		var v_axis := (fixed_axis + 2) % 3
+		for u in resolution:
+			for v in resolution:
+				var c00 := Vector3i.ZERO
+				var c10 := Vector3i.ZERO
+				var c01 := Vector3i.ZERO
+				var c11 := Vector3i.ZERO
+				c00[fixed_axis] = fixed_val; c00[u_axis] = u;     c00[v_axis] = v
+				c10[fixed_axis] = fixed_val; c10[u_axis] = u + 1; c10[v_axis] = v
+				c01[fixed_axis] = fixed_val; c01[u_axis] = u;     c01[v_axis] = v + 1
+				c11[fixed_axis] = fixed_val; c11[u_axis] = u + 1; c11[v_axis] = v + 1
+				var corners := [c00, c10, c01, c11]
+				var dq := PackedFloat32Array(); dq.resize(4)
+				for ci in 4:
+					var c : Vector3i = corners[ci]
+					dq[ci] = d[(c.x + 1) + (c.y + 1) * gs + (c.z + 1) * gs2]
+				var fcase := 0
+				for ci in 4:
+					if dq[ci] > 0.0:
+						fcase |= 1 << ci
+				if fcase == 0 or fcase == 15:
+					continue
+				var cps : Array[Vector3] = []
+				var cns : Array[Vector3] = []
+				for ei in 4:
+					var a : int = face_edges[ei][0]
+					var b : int = face_edges[ei][1]
+					if signf(dq[a]) == signf(dq[b]):
+						continue
+					var denom := dq[a] - dq[b]
+					var t : float = 0.5 if absf(denom) < 1e-8 else dq[a] / denom
+					t = clampf(t, 0.0, 1.0)
+					var ca : Vector3i = corners[a]
+					var cb : Vector3i = corners[b]
+					var pa := base + Vector3(ca.x + 1, ca.y + 1, ca.z + 1) * voxel
+					var pb := base + Vector3(cb.x + 1, cb.y + 1, cb.z + 1) * voxel
+					cps.append(pa.lerp(pb, t))
+					var ga : int = ca.x + ca.y * cs + ca.z * cs2
+					var gb : int = cb.x + cb.y * cs + cb.z * cs2
+					var na := Vector3(grad_x[ga], grad_y[ga], grad_z[ga])
+					var nb := Vector3(grad_x[gb], grad_y[gb], grad_z[gb])
+					cns.append(na.lerp(nb, t))
+				if cps.size() < 2:
+					continue
+				@warning_ignore("integer_division")
+				var n_pairs : int = cps.size() / 2
+				for pi in n_pairs:
+					var p0 : Vector3 = cps[pi * 2 + 0]
+					var p1 : Vector3 = cps[pi * 2 + 1]
+					var n0 : Vector3 = cns[pi * 2 + 0]
+					var n1 : Vector3 = cns[pi * 2 + 1]
+					var p0d : Vector3 = p0 + (planet_center - p0).normalized() * drop
+					var p1d : Vector3 = p1 + (planet_center - p1).normalized() * drop
+					var bi := positions.size()
+					positions.append(p0); positions.append(p1)
+					positions.append(p1d); positions.append(p0d)
+					# Same surface normal on all 4 so the wall shades like the
+					# terrain it continues from (finalise pass negates/outwards).
+					normals.append(n0); normals.append(n1)
+					normals.append(n1); normals.append(n0)
+					# Double-sided so the seal holds from whichever side the
+					# crack opens (the cull direction varies per cell).
+					indices.append(bi + 0); indices.append(bi + 1); indices.append(bi + 2)
+					indices.append(bi + 0); indices.append(bi + 2); indices.append(bi + 3)
+					indices.append(bi + 0); indices.append(bi + 2); indices.append(bi + 1)
+					indices.append(bi + 0); indices.append(bi + 3); indices.append(bi + 2)
 
 
 # Boundary-face skirts: a strip of inward-dropping triangles per face cell
@@ -1044,7 +1158,7 @@ static func _append_lod_safety_skirts(
 				# Emit one skirt quad per crossing pair (cases with 4 crossings
 				# get two skirt strips). The strip drops radially toward planet
 				# centre, double-sided so it seals from either side.
-				var n_pairs : int = crossings.size() / 2
+				var n_pairs : int = crossings.size() >> 1
 				for pi in n_pairs:
 					var p0 : Vector3 = crossings[pi * 2 + 0]
 					var p1 : Vector3 = crossings[pi * 2 + 1]
