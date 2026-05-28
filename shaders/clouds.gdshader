@@ -23,15 +23,18 @@ uniform vec3  sun_color   : source_color = vec3(1.0, 0.96, 0.86);
 uniform vec3  cloud_color : source_color = vec3(1.0, 1.0, 1.0);
 uniform vec3  cloud_shadow_color : source_color = vec3(0.42, 0.47, 0.60);
 
-uniform float coverage     : hint_range(0.0, 1.0)    = 0.48;  // higher = fewer/smaller clouds
-uniform float density_mul  : hint_range(0.0, 8.0)    = 3.2;
-uniform float cloud_scale  : hint_range(0.0001, 0.02)= 0.0016;
+uniform float coverage     : hint_range(0.0, 1.0)    = 0.52;  // higher = fewer/smaller clouds; 0.62 was too sparse for the planet's size
+uniform float density_mul  : hint_range(0.0, 8.0)    = 1.6;   // lower → more translucent, less "thick fog"
+uniform float cloud_scale  : hint_range(0.0001, 0.02)= 0.00045; // big planet → big formations: was 0.0016 (≈625 m features) which tiled ~40× and read as a uniform sheet
+uniform float detail_scale : hint_range(0.001, 0.1)  = 0.008;   // high-freq noise that breaks up the silhouette so clouds don't read as one flat mass
+uniform float detail_strength : hint_range(0.0, 0.6) = 0.16;   // halved: 0.32 was strong enough to push base above coverage BELOW threshold, which made clouds blink in/out as the detail noise drifted
 uniform float drift_speed  : hint_range(0.0, 0.05)   = 0.004;
 
-// Constant (not a uniform) so the march compiles to a fixed-count loop —
-// dynamic loop bounds can trip Metal's SPIR-V→MSL converter. Bump it for
-// smoother clouds at the cost of fragment work.
-const int march_steps = 18;
+// Upper bound on raymarch samples. Kept constant so the loop compiles to a
+// fixed count — dynamic loop *bounds* can trip Metal's SPIR-V→MSL converter, so
+// instead we keep this bound fixed and `break` early (a dynamic break is fine).
+// Proximity LOD picks the actual sample count per-pixel from the view distance.
+const int MAX_MARCH_STEPS = 16;
 
 varying vec3 v_world;
 
@@ -63,10 +66,12 @@ float vnoise(vec3 p) {
 float fbm(vec3 p) {
 	float t = 0.0;
 	float a = 0.5;
-	for (int i = 0; i < 4; i++) {
+	// 5 octaves (was 3) so big cloud bodies get visible internal structure
+	// — wisps, bumps, edge ragged-ness — instead of looking like sprayed paint.
+	for (int i = 0; i < 5; i++) {
 		t += vnoise(p) * a;
-		p *= 2.03;
-		a *= 0.5;
+		p = p * 2.07 + vec3(13.0, 7.0, 19.0);   // domain offset per octave avoids axis-aligned banding
+		a *= 0.52;
 	}
 	return t;
 }
@@ -81,8 +86,18 @@ float cloud_density(vec3 wp) {
 	float vfall = clamp(1.0 - abs(r - mid) / half_span, 0.0, 1.0);
 	vfall = smoothstep(0.0, 0.6, vfall);
 	vec3 sp = rel * cloud_scale + vec3(TIME * drift_speed, 0.0, TIME * drift_speed * 0.7);
-	float n = fbm(sp);
-	float d = smoothstep(coverage, coverage + 0.35, n) * vfall;
+	float base = fbm(sp);
+	// Layer in a higher-frequency detail noise that EATS INTO the base shape
+	// (subtracted, not added) — the "billow" technique: it carves ragged
+	// holes/tendrils out of solid masses so silhouettes break up instead of
+	// reading as smooth blobs. The detail is INTENTIONALLY NOT time-animated
+	// (drifting it caused clouds to flicker in/out at the coverage edge);
+	// only the low-freq base drifts, the detail texture is locked to space.
+	float detail = fbm(rel * detail_scale);
+	float n = base - detail_strength * (1.0 - detail);
+	// Wider coverage band → more partial-density edges instead of binary
+	// "cloud / no cloud", which is what reads as the flat-colour look.
+	float d = smoothstep(coverage, coverage + 0.55, n) * vfall;
 	return d * density_mul;
 }
 
@@ -126,25 +141,35 @@ void fragment() {
 	}
 
 	vec3 to_sun = -normalize(sun_direction);
+	// Proximity LOD: many samples when the deck is close (flying through it),
+	// few when it's a thin distant band from orbit (where it covers the whole
+	// screen and each step is a full-screen cost). `t_enter` is the view-space
+	// distance to where the ray first hits the deck.
+	int steps = int(clamp(8000.0 / max(t_enter, 1.0), 5.0, float(MAX_MARCH_STEPS)));
 	float seg = t_exit - t_enter;
-	float dt = seg / float(march_steps);
+	float dt = seg / float(steps);
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
 	float transmittance = 1.0;
 	vec3 scattered = vec3(0.0);
-	for (int i = 0; i < march_steps; i++) {
+	for (int i = 0; i < MAX_MARCH_STEPS; i++) {
+		if (i >= steps) { break; }
 		float t = t_enter + (float(i) + 0.5) * dt;
 		vec3 pos = ro + rd * t;
 		float dens = cloud_density(pos);
 		if (dens > 0.001) {
 			// Cheap self-shadow: accumulate density toward the sun.
 			float ls = 0.0;
-			for (int j = 1; j <= 2; j++) {
+			for (int j = 1; j <= 1; j++) {
 				ls += cloud_density(pos + to_sun * light_step * float(j));
 			}
 			float light = exp(-ls * 0.5);
 			float a = 1.0 - exp(-dens * dt);
-			vec3 col = mix(cloud_shadow_color, cloud_color, light);
+			// Vertical depth shading: darker, cooler base → brighter, warmer top,
+			// so the deck reads as volumetric instead of a flat one-colour sheet.
+			float hf = clamp((length(pos - planet_center) - cloud_inner)
+					/ max(cloud_outer - cloud_inner, 1.0), 0.0, 1.0);
+			vec3 col = mix(cloud_shadow_color, cloud_color, light) * mix(0.6, 1.2, hf);
 			scattered += transmittance * a * col;
 			transmittance *= (1.0 - a);
 			if (transmittance < 0.02) {

@@ -29,10 +29,10 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, l
 @export var collision_lod_max : int = 1          # build collision for chunks at this LOD or below
 @export var scatter_lod_max : int = 1            # scatter props (rocks) on chunks at this LOD or below
 @export var sea_level_offset : float = -12.0     # passed to scatter so it skips submerged triangles
-@export var max_new_chunks_per_tick  : int = 16
-@export var max_remesh_per_tick      : int = 8   # neighbour-mask re-meshes (own budget so they can't starve initial load)
-@export var max_free_chunks_per_tick : int = 16
-@export var stale_tolerance : int = 30           # frames a chunk can be unvisited before free
+@export var max_new_chunks_per_tick  : int = 96   # raised: with thousands of chunks pending, 16/tick takes ~10 s to drain — far longer than the atomic-swap hold window, so cracks appear; pushing throughput keeps the visible frontier ahead of the camera
+@export var max_remesh_per_tick      : int = 128  # neighbour-mask re-meshes; prioritised so the atomic-swap gate releases fast
+@export var max_free_chunks_per_tick : int = 64
+@export var stale_tolerance : int = 90           # frames a chunk can be unvisited before free — wider window so the atomic-swap gate (parent meshed + fine neighbours re-meshed for new transition mask) ALWAYS completes before the old chunk is freed; was 30 (~0.5 s), too short under load
 @export var terrain_material : Material
 
 # Shared scatter resources — created once, referenced by every chunk's
@@ -57,6 +57,18 @@ var _pending_remesh: Array      = []   # keys queued to re-mesh after a neighbou
 var _generation   : int        = 0
 var _camera       : Camera3D
 var _total_tris   : int        = 0
+# Re-traversal gating: the LOD octree only changes when the camera moves, so we
+# skip the (expensive) traverse + 26-neighbour balance walk while it's roughly
+# stationary. `_retraverse_threshold` is set in _ready to ~half a finest voxel.
+var _last_cam_local      : Vector3 = Vector3(1e20, 1e20, 1e20)
+var _retraverse_threshold: float   = 2.0
+# The 2:1-violation HUD stat is O(chunks·faces·depth); compute it occasionally,
+# not every frame.
+var _violation_frame     : int     = 0
+var _cached_violations   : int     = 0
+# Native (Rust) Transvoxel mesher, shared by every chunk. Null if the
+# GDExtension didn't load (then no meshing happens — see the startup log).
+var _native       : Object
 
 class ChunkRecord:
 	var chunk      : VoxelChunk
@@ -67,7 +79,7 @@ class ChunkRecord:
 	var last_seen  : int = 0
 	var has_mesh   : bool = false
 	var tri_count  : int = 0
-	var coarser_mask : int = 0   # per-face bitmask of "neighbour is coarser"
+	var transition_mask : int = 0   # per-face bitmask of "neighbour is FINER" (transition side)
 
 
 func _ready() -> void:
@@ -83,6 +95,11 @@ func _ready() -> void:
 		terrain_material = m
 	_scatter_mesh     = TerrainScatter.make_rock_mesh()
 	_scatter_material = TerrainScatter.make_rock_material()
+	if ClassDB.class_exists("NativeTerrain"):
+		_native = ClassDB.instantiate("NativeTerrain")
+	else:
+		push_error("NativeTerrain GDExtension not loaded — no terrain will mesh.")
+	_retraverse_threshold = base_chunk_size / float(voxel_resolution) * 0.5
 	_camera = _find_camera()
 
 
@@ -113,21 +130,43 @@ func _process(_dt: float) -> void:
 	# the octree (which works in the planet's local space) compares apples
 	# to apples even when the parent PlanetSystem has orbited or rotated.
 	var cam_local := to_local(_camera.global_position)
-	_traverse_root(cam_local)
-	_collect_stale_chunks()
-	# Balance is enforced INLINE during traversal (`_balance_requires_subdivide`
-	# with the exact closest-point test), which produces an already-2:1 octree
-	# as a pure function of camera position — stable frame-to-frame. The old
-	# post-pass `_enforce_octree_balance` is intentionally NOT called: it relied
-	# on `_split_chunk`, which freed a coarse chunk's mesh BEFORE its finer
-	# replacements were built (a "chunks disappear" hole), and with the inline
-	# check correct it has nothing to fix. The HUD's "2:1 violations" readout
-	# verifies the inline check is holding; if it ever reads non-zero we fix the
-	# inline check rather than papering over it with hole-punching splits.
+	# Only re-decide the LOD octree (the costly traverse + inline 26-neighbour
+	# balance walk) when the camera has actually moved. While hovering, the
+	# octree is identical frame-to-frame, so we just keep the existing chunks
+	# alive and skip the heavy work — that's the main framerate win.
+	if cam_local.distance_to(_last_cam_local) > _retraverse_threshold:
+		_last_cam_local = cam_local
+		_traverse_root(cam_local)
+		_collect_stale_chunks()
+	else:
+		for rec in _chunks.values():
+			(rec as ChunkRecord).last_seen = _generation
+	# Balance is enforced INLINE during traversal; no post-pass (it punched
+	# holes by freeing coarse chunks before their finer replacements built).
 	_update_neighbor_masks()
 	_drain_pending_load()
+	_poll_native()
+	# 2:1-violation stat is expensive — refresh it ~twice a second, not per frame.
+	_violation_frame += 1
+	if _violation_frame >= 30:
+		_violation_frame = 0
+		_cached_violations = _count_balance_violations()
 	stats_changed.emit(_chunks.size(), _pending_load.size() + _pending_remesh.size(),
-			_total_tris, _count_balance_violations())
+			_total_tris, _cached_violations)
+
+
+# Collect finished meshes from the native thread pool and route each back to
+# its chunk by instance id. take_result is always called (even for freed
+# chunks) so the native result map can't leak.
+func _poll_native() -> void:
+	if _native == null:
+		return
+	var ids : PackedInt64Array = _native.call("poll_ready_ids")
+	for id in ids:
+		var res : Dictionary = _native.call("take_result", id)
+		var obj := instance_from_id(id)
+		if obj != null and obj is VoxelChunk:
+			(obj as VoxelChunk).apply_native_result(res)
 
 
 func _traverse_root(cam_pos: Vector3) -> void:
@@ -282,6 +321,9 @@ func _ensure_chunk(lod: int, coords: Vector3i, origin: Vector3, size: float) -> 
 	rec.chunk.scatter_lod_max  = scatter_lod_max
 	rec.chunk.planet_radius_for_scatter = planet_radius
 	rec.chunk.sea_level_offset_for_scatter = sea_level_offset
+	# Native mesher + the seed it rebuilds the density from.
+	rec.chunk.native = _native
+	rec.chunk.world_seed = world_seed
 	# Capture rec via the closure so we can count triangles when ready.
 	rec.chunk.mesh_ready.connect(func(c: VoxelChunk) -> void:
 		rec.has_mesh = true
@@ -316,7 +358,14 @@ func _collect_stale_chunks() -> void:
 		# reverse when the camera moves away (children stale, parent still
 		# meshing). Wait for a viable replacement first; only force-free
 		# after a hard cap so a wedged transition can't leak forever.
-		var has_replacement := _has_ready_parent(rec) or _has_ready_children(rec)
+		# ATOMIC LOD swap: only free a stale chunk once its replacement is BOTH
+		# meshed AND consistent with its neighbours. For coarsening that means
+		# the parent is meshed *and* the parent's finer neighbours have re-meshed
+		# to include their transition toward it — otherwise we'd briefly show the
+		# coarse parent next to a still-fine neighbour with no transition (the
+		# transient crack). Holding the old fine chunk until then keeps the
+		# boundary consistent through the swap.
+		var has_replacement := _coarsening_ready(rec) or _has_ready_children(rec)
 		var force_free := age > stale_tolerance * 8
 		if not has_replacement and not force_free:
 			continue
@@ -327,16 +376,46 @@ func _collect_stale_chunks() -> void:
 		freed += 1
 
 
-# True if the coarser octree parent of `rec` exists and has a finished mesh.
-# Used as a "we can free this fine chunk now" check during coarsening.
-func _has_ready_parent(rec: ChunkRecord) -> bool:
+# Atomic-swap gate for coarsening: the parent is meshed AND every finer chunk
+# bordering the parent has re-meshed to include its transition toward the
+# parent. Until then, freeing `rec` would expose the coarse parent next to a
+# fine neighbour with a stale (no-transition) boundary — the transient crack.
+func _coarsening_ready(rec: ChunkRecord) -> bool:
 	if rec.lod >= max_lod:
 		return false
-	var parent_coords := Vector3i(rec.coords.x >> 1, rec.coords.y >> 1, rec.coords.z >> 1)
-	var parent_key := _key(rec.lod + 1, parent_coords)
-	if not _chunks.has(parent_key):
+	var p_coords := Vector3i(rec.coords.x >> 1, rec.coords.y >> 1, rec.coords.z >> 1)
+	var parent : ChunkRecord = _chunks.get(_key(rec.lod + 1, p_coords))
+	if parent == null or not parent.has_mesh:
 		return false
-	return (_chunks[parent_key] as ChunkRecord).has_mesh
+	if parent.lod == 0:
+		return true
+	var fine_lod := parent.lod - 1
+	var faces := [
+		[Vector3i(-1, 0, 0), 0, -1], [Vector3i(1, 0, 0), 0, 1],
+		[Vector3i(0, -1, 0), 1, -1], [Vector3i(0, 1, 0), 1, 1],
+		[Vector3i(0, 0, -1), 2, -1], [Vector3i(0, 0, 1), 2, 1],
+	]
+	for f in faces:
+		var delta : Vector3i = f[0]
+		var axis  : int      = f[1]
+		var sgn   : int      = f[2]
+		var nbr := parent.coords + delta
+		# The 2×2 finer children of the neighbour cell that touch the parent's
+		# shared face. If any exists and is mid-re-mesh, hold off freeing.
+		var base := nbr * 2
+		var near : int = 0 if sgn > 0 else 1
+		var u := (axis + 1) % 3
+		var v := (axis + 2) % 3
+		for du in 2:
+			for dv in 2:
+				var child := base
+				child[axis] = base[axis] + near
+				child[u] = base[u] + du
+				child[v] = base[v] + dv
+				var c : ChunkRecord = _chunks.get(_key(fine_lod, child))
+				if c != null and c.chunk != null and c.chunk.is_dirty():
+					return false
+	return true
 
 
 # True if every finer child of `rec` that the octree needs is meshed. Used as
@@ -364,43 +443,6 @@ func _has_ready_children(rec: ChunkRecord) -> bool:
 	return true
 
 
-# Enforce a 2:1 (restricted) octree across the active chunk set. After the
-# main traversal a coarse chunk can end up face-adjacent to chunks 2+ LODs
-# finer — usually at sharp distance transitions (e.g. the camera grazing the
-# planet's horizon). Lengyel's transition cells assume strictly 2:1, so any
-# 4:1+ neighbour creates visible gaps. We fix it by finding every coarse
-# chunk that has a finer-than-allowed face neighbour and force-subdividing
-# it; cascading is handled by looping until a pass finds no violations
-# (capped to avoid runaway when the camera moves fast).
-func _enforce_octree_balance() -> void:
-	var max_passes := 6
-	for _pass_idx in max_passes:
-		# Collect distinct coarse chunks that violate the 2:1 rule. We walk
-		# from each fine chunk's perspective, ask which ancestor of each
-		# face-adjacent position is active in the octree, and queue that
-		# ancestor for subdivision iff its LOD is ≥ 2 greater than ours.
-		var unique_split : Dictionary = {}
-		for key in _chunks.keys():
-			var rec : ChunkRecord = _chunks[key]
-			if rec.lod >= max_lod - 1:
-				continue   # no neighbour can be 2+ LODs coarser if we're already near root
-			for face_bit in 6:
-				var coarse_rec := _coarsest_face_neighbour(rec, face_bit)
-				if coarse_rec == null:
-					continue
-				if coarse_rec.lod >= rec.lod + 2:
-					unique_split[_key(coarse_rec.lod, coarse_rec.coords)] = coarse_rec
-		if unique_split.is_empty():
-			return
-		for r in unique_split.values():
-			if _chunks.has(_key(r.lod, r.coords)):
-				_split_chunk(r)
-
-
-# Walk up the ancestor chain from `rec`'s face neighbour at the same LOD
-# until we find an active chunk in `_chunks`, or run out of levels. Returns
-# the active chunk record, or null if no chunk covers that neighbour cell.
-# O(max_lod) lookups per call.
 # Diagnostic: count face-adjacent chunk pairs whose LOD differs by ≥ 2 (a
 # broken 2:1 restriction). Transvoxel transition cells can only stitch a 1-LOD
 # step, so any nonzero count here is a real source of boundary gaps. This is
@@ -443,69 +485,38 @@ func _coarsest_face_neighbour(rec: ChunkRecord, face_bit: int) -> ChunkRecord:
 	return null
 
 
-# Replace a single chunk with its 8 children at lod-1, mirroring the leaf-
-# creation path in `_visit_node`/`_ensure_chunk`. The children's last_seen
-# is stamped with the current generation so the stale-collector doesn't
-# immediately reap them again on the next tick.
-func _split_chunk(rec: ChunkRecord) -> void:
-	var key := _key(rec.lod, rec.coords)
-	if not _chunks.has(key):
-		return
-	_total_tris -= rec.tri_count
-	if rec.chunk:
-		rec.chunk.release()
-	_chunks.erase(key)
-	var child_lod := rec.lod - 1
-	var child_size := rec.size * 0.5
-	for child in 8:
-		var dx := child & 1
-		var dy := (child >> 1) & 1
-		var dz := (child >> 2) & 1
-		var child_origin := rec.origin + Vector3(dx, dy, dz) * child_size
-		if not _aabb_intersects_planet(child_origin, child_size):
-			continue
-		var child_coords := Vector3i(
-				rec.coords.x * 2 + dx, rec.coords.y * 2 + dy, rec.coords.z * 2 + dz)
-		var child_rec := _ensure_chunk(child_lod, child_coords, child_origin, child_size)
-		child_rec.last_seen = _generation
-
-
-# Walk every active leaf and compute its 6-bit "coarser neighbour" mask.
-# Queue a re-mesh whenever the mask differs from the one the chunk was last
-# built with — that's the trigger for keeping the boundary crack-free as the
-# LOD frontier shifts. The re-mesh goes through the normal pending_load queue,
-# so it's throttled by `max_new_chunks_per_tick`.
+# Walk every active leaf and compute its 6-bit transition mask. Queue a re-mesh
+# whenever the mask differs from the one the chunk was last built with — that
+# keeps the boundary watertight as the LOD frontier shifts. Throttled via the
+# low-priority `_pending_remesh` queue.
 func _update_neighbor_masks() -> void:
 	for key in _chunks.keys():
 		var rec : ChunkRecord = _chunks[key]
 		if not rec.has_mesh:
-			# Will pick up the right mask when the initial mesh runs — set it
-			# directly so request_build snapshots the correct value.
-			rec.coarser_mask = _compute_coarser_mask(rec.lod, rec.coords)
+			# Set directly so the first request_build snapshots the right value.
+			rec.transition_mask = _compute_coarser_mask(rec.lod, rec.coords)
 			if rec.chunk:
-				rec.chunk.coarser_mask = rec.coarser_mask
+				rec.chunk.transition_mask = rec.transition_mask
 			continue
 		var new_mask := _compute_coarser_mask(rec.lod, rec.coords)
-		if rec.chunk and rec.chunk.set_coarser_mask(new_mask):
-			rec.coarser_mask = new_mask
-			# Re-queue on the LOW-PRIORITY re-mesh queue. request_build is a
-			# no-op while a task is still in flight, so the queue throttles
-			# re-mesh waves; deferring behind initial loads also lets a burst
-			# of transient mask flips (neighbours streaming in one-by-one)
-			# collapse into a single re-mesh once the frontier settles.
+		if rec.chunk and rec.chunk.set_transition_mask(new_mask):
+			rec.transition_mask = new_mask
+			# Deferred low-priority re-queue: lets a burst of transient mask
+			# flips (neighbours streaming in) collapse into one re-mesh.
 			if not _pending_remesh.has(key):
 				_pending_remesh.append(key)
 
 
-# For chunk at (lod, coords), check each of 6 face directions: is the
-# neighbour at the same LOD missing AND its coarser parent present? If so,
-# that face has a coarser neighbour. Returns a 6-bit mask:
+# For chunk at (lod, coords), find faces whose neighbour is COARSER — the side
+# on which THIS finer block emits Transvoxel transition cells (the convention
+# the hand-rolled mesher in mesher.rs uses). A face is coarser-bordering when
+# its same-LOD neighbour cell is absent but an ANCESTOR (parent, grandparent…)
+# of that cell is an active chunk. Returns a 6-bit mask:
 #   bit 0 -X, 1 +X, 2 -Y, 3 +Y, 4 -Z, 5 +Z.
 func _compute_coarser_mask(lod: int, coords: Vector3i) -> int:
 	if lod >= max_lod:
 		return 0
 	var mask := 0
-	# 6 face offsets in coord-space (Δix, Δiy, Δiz, bit_index)
 	var offsets := [
 		[Vector3i(-1, 0, 0), 0],
 		[Vector3i( 1, 0, 0), 1],
@@ -518,17 +529,11 @@ func _compute_coarser_mask(lod: int, coords: Vector3i) -> int:
 		var delta : Vector3i = off[0]
 		var bit   : int      = off[1]
 		var nbr_coords := coords + delta
-		# Same-LOD neighbour present? Then no transition cells needed on this face.
+		# Same-LOD neighbour present? Then no transition on this face.
 		if _chunks.has(_key(lod, nbr_coords)):
 			continue
-		# Walk the ancestor chain (parent, grandparent, …) until we find an
-		# active chunk covering the neighbour cell. `_enforce_octree_balance`
-		# tries to keep the LOD difference at 1, but during the frames in
-		# which it hasn't converged yet (camera moving fast, chunks still
-		# meshing) the neighbour can sit 2+ LODs above us. We still want to
-		# emit transition cells in that transient — the geometry is only
-		# 2:1-shaped so the stitch isn't perfect for a 4:1+ gap, but it's
-		# vastly preferable to leaving a hole until balance finishes.
+		# Walk the ancestor chain until we find an active chunk covering the
+		# neighbour cell; if found, that neighbour is coarser → transition.
 		var anc_coords := Vector3i(nbr_coords.x >> 1, nbr_coords.y >> 1, nbr_coords.z >> 1)
 		var anc_lod := lod + 1
 		while anc_lod <= max_lod:
@@ -541,20 +546,11 @@ func _compute_coarser_mask(lod: int, coords: Vector3i) -> int:
 
 
 func _drain_pending_load() -> void:
-	# Initial meshes first — getting *some* surface in front of the player
-	# everywhere beats perfecting seams on already-covered chunks. The stale
-	# skips don't consume budget, so a frame's whole budget goes to real work.
-	var dispatched := 0
-	while dispatched < max_new_chunks_per_tick and not _pending_load.is_empty():
-		var key : String = _pending_load.pop_front()
-		if not _chunks.has(key):
-			continue
-		var rec : ChunkRecord = _chunks[key]
-		if (_generation - rec.last_seen) > stale_tolerance:
-			continue
-		rec.chunk.request_build()
-		dispatched += 1
-	# Then heal LOD-transition seams on a separate, smaller budget.
+	# Re-meshes FIRST. A re-mesh is a boundary that has a transition mismatch
+	# RIGHT NOW (a coarsening neighbour) — submitting it promptly releases the
+	# atomic-swap gate quickly, so the old fine chunks aren't held long and the
+	# transient window stays tiny. Meshing is off-thread, so this just queues to
+	# the worker pool; getting the seam-fixers in first is what matters.
 	var remeshed := 0
 	while remeshed < max_remesh_per_tick and not _pending_remesh.is_empty():
 		var rkey : String = _pending_remesh.pop_front()
@@ -565,6 +561,17 @@ func _drain_pending_load() -> void:
 			continue
 		rrec.chunk.request_build()
 		remeshed += 1
+	# Then initial meshes for newly-revealed chunks.
+	var dispatched := 0
+	while dispatched < max_new_chunks_per_tick and not _pending_load.is_empty():
+		var key : String = _pending_load.pop_front()
+		if not _chunks.has(key):
+			continue
+		var rec : ChunkRecord = _chunks[key]
+		if (_generation - rec.last_seen) > stale_tolerance:
+			continue
+		rec.chunk.request_build()
+		dispatched += 1
 
 
 func _key(lod: int, coords: Vector3i) -> String:

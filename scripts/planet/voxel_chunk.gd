@@ -28,14 +28,23 @@ var scatter_lod_max  : int   = 1
 var planet_radius_for_scatter : float = 0.0
 var sea_level_offset_for_scatter : float = 0.0
 
-var coarser_mask  : int = 0       # which faces have a coarser neighbour
+# Transvoxel transition mask. Per the `transvoxel` crate's convention this
+# marks faces whose neighbour is FINER (higher-res) — the side on which THIS
+# (coarser) block emits a transition face. Bit 0 -X, 1 +X, 2 -Y, 3 +Y, 4 -Z, 5 +Z.
+var transition_mask : int = 0
 var _last_built_mask : int = -1   # the mask the current mesh was built with
+
+# Native (Rust) mesher + the seed it needs to rebuild the density. Set by the
+# planet before the first build. When `native` is null we have no mesher.
+var native      : Object
+var world_seed  : int = 0
 
 var _mesh_instance : MeshInstance3D
 var _static_body   : StaticBody3D
 var _coll_shape    : CollisionShape3D
 var _scatter_mmi   : MultiMeshInstance3D
 var _task_id       : int = -1
+var _pending       : bool = false   # a native mesh job is in flight
 var _alive         : bool = true
 var _has_mesh      : bool = false
 var _holder        : _MeshResultHolder
@@ -83,33 +92,36 @@ func setup(
 
 
 func request_build() -> void:
-	if _task_id != -1 or _holder != null:
+	# Non-blocking: submit the chunk to the native thread pool and return. The
+	# planet collects the finished mesh via poll/take and calls
+	# apply_native_result() — so meshing runs off the main thread (good FPS)
+	# without ever calling gdext from a worker (the part that crashed).
+	if native == null or not _alive or _pending:
 		return
-	var holder := _MeshResultHolder.new()
-	_holder = holder
-	# Snapshot all inputs so the worker captures plain values, not `self`.
-	var input := {
-		"origin": origin,
-		"size":   size,
-		"resolution": resolution,
-		"planet_center": planet_center,
-		"density": density,
-		"coarser_mask": coarser_mask,
-		"skirts": false,   # boundary resampling supersedes skirts
-	}
-	_last_built_mask = coarser_mask
-	_task_id = WorkerThreadPool.add_task(
-		func() -> void: holder.set_result(ChunkMesher.build(input)),
-		true,
-		"voxel-chunk-build")
+	_pending = true
+	_last_built_mask = transition_mask
+	native.call("submit_chunk", get_instance_id(), world_seed,
+		float(planet_radius_for_scatter), origin, size, resolution,
+		transition_mask, planet_center)
+
+
+# Called by the planet octree when this chunk's native mesh is ready.
+func apply_native_result(result: Dictionary) -> void:
+	_pending = false
+	if not _alive:
+		queue_free()
+		return
+	_apply_mesh(result)
+	_has_mesh = true
+	mesh_ready.emit(self)
 
 
 # Called by the planet octree when neighbour LODs change. Returns true if the
 # mask changed and the chunk should be re-meshed.
-func set_coarser_mask(mask: int) -> bool:
-	if mask == coarser_mask:
+func set_transition_mask(mask: int) -> bool:
+	if mask == transition_mask:
 		return false
-	coarser_mask = mask
+	transition_mask = mask
 	return _has_mesh and mask != _last_built_mask
 
 
@@ -117,7 +129,16 @@ func set_coarser_mask(mask: int) -> bool:
 # mask than the current one (i.e. neighbour LODs have changed and we need
 # to re-mesh to keep the boundary crack-free).
 func needs_remesh_for_mask() -> bool:
-	return _has_mesh and coarser_mask != _last_built_mask
+	return _has_mesh and transition_mask != _last_built_mask
+
+
+# "My currently DISPLAYED mesh isn't consistent with my current transition mask"
+# — either a mesh job is in flight (the new mesh hasn't been applied yet) or the
+# mask changed and no job is queued yet. Used by the atomic-swap gate so old
+# geometry is held until the replacement's neighbours are actually re-meshed
+# (not merely submitted — `_last_built_mask` updates at submit time).
+func is_dirty() -> bool:
+	return _pending or transition_mask != _last_built_mask
 
 
 func _process(_dt: float) -> void:

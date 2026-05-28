@@ -7,14 +7,16 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# api-custom generates bindings from the running Godot binary (GODOT4_BIN),
-# which is required for a dev build like 4.7.dev3 that the released gdext
-# bindings don't target.
-# Pinned to 0.4.5: gdext 0.5.x references newer GDExtension interface fields
-# (e.g. classdb_construct_object3) that Godot 4.7.dev3 doesn't expose yet.
-# 0.4.5 targets the older interface that this dev build still provides, and
-# api-custom generates the concrete bindings from the running binary.
-godot = { version = "=0.5.2", features = ["api-custom"] }
+# Noise is hand-rolled (src/noise.rs) — no noise crate.
+# gdext 0.4.5 with DEFAULT bindings (Godot 4.4 API) — NOT api-custom. Matching
+# the exact 4.7.dev3 binary via api-custom caused version skew (codegen/ffi
+# mismatches). Instead we rely on Godot's forward-compatible GDExtension ABI:
+# a library built against the 4.4 interface loads and runs in 4.7.dev3, and
+# 0.4.5 only calls interface fns (classdb_construct_object2, …) that dev3 still
+# provides. No GODOT4_BIN / libclang needed; the bindings are bundled.
+# No experimental-threads: meshing runs on an internal std::thread pool that
+# never touches the Godot API; all gdext calls (submit/poll/take) are main-thread.
+godot = "=0.4.5"
 
 [profile.release]
 opt-level = 3

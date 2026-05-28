@@ -4,9 +4,8 @@ extends Node3D
 ## the player as a child of the planet system so they travel with the orbit,
 ## and wires the planet's chunk streamer to the player's camera.
 
-const PLANET_RADIUS    : float = 4000.0
-const ATMOSPHERE_RADIUS: float = 4520.0
-const SPAWN_ALTITUDE   : float = 1900.0   # safely above the highest possible terrain (max surface now ≈ +1576 m with spires/plateaus)
+const PLANET_RADIUS    : float = 24000.0   # ~3× previous; reads as a proper planet from orbit and gives the atmosphere shell real visual thickness
+const SPAWN_ALTITUDE   : float = 500.0   # safely above the highest possible terrain (max surface ≈ radius +470 m after the scaled-down height budget)
 
 var world  : PlanetaryWorld
 var player : FlightPlayer
@@ -18,9 +17,21 @@ var _wireframe : bool = false
 
 
 func _ready() -> void:
+	# TEMP: confirm the native (Rust) GDExtension loaded in this Godot build.
+	# Safe even if it didn't load (no hard class reference). Remove once verified.
+	if ClassDB.class_exists("NativeTerrain"):
+		var nt : Object = ClassDB.instantiate("NativeTerrain")
+		print("[native] transvoxel_native LOADED — ping = ", nt.call("ping"))
+		var st : Vector3 = nt.call("surface_radius_stats", 1337, PLANET_RADIUS)
+		print("[terrain] surface radius  min=%.1f  mean=%.1f  max=%.1f   sea=%.1f  (ocean where surface < sea)" % [
+			st.x, st.y, st.z, PLANET_RADIUS - 80.0])
+	else:
+		print("[native] transvoxel_native NOT loaded (extension didn't register)")
+
 	world = PlanetaryWorld.new()
+	# planet_radius is the single size knob: world derives the atmosphere/cloud
+	# shell radii from it (planet_radius + fixed absolute offsets) in _ready.
 	world.planet_radius = PLANET_RADIUS
-	world.atmosphere_radius = ATMOSPHERE_RADIUS
 	world.name = "World"
 	add_child(world)
 

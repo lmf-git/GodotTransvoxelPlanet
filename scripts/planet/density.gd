@@ -15,11 +15,16 @@ extends RefCounted
 ## thread without locking. FastNoiseLite is thread-safe for reads in Godot 4.
 
 const PLANET_RADIUS_DEFAULT : float = 4000.0
-const MAX_TERRAIN_HEIGHT    : float = 600.0   # tallest possible mountain peak above mean radius
-const MAX_SPIRE_HEIGHT      : float = 420.0   # how tall the dramatic NMS-style pinnacles can get
-const MAX_PLATEAU_RISE      : float = 220.0   # how high a mesa top can sit above the local base
-const MAX_CANYON_DEPTH      : float = 260.0   # how deep a slot canyon can cut
-const CAVE_BOTTOM_DEPTH     : float = 380.0
+# Scaled down ~3.5× for the 24 km planet — keeps mountains visible from a
+# distance without dominating the horizon. Both the Rust mesher and this
+# script MUST agree (Rust meshes the surface; this script is what the
+# player's altitude / surface-snap queries hit), so update density.rs in
+# lockstep with any change here.
+const MAX_TERRAIN_HEIGHT    : float = 170.0   # tallest possible mountain peak above mean radius
+const MAX_SPIRE_HEIGHT      : float = 120.0   # how tall the dramatic NMS-style pinnacles can get
+const MAX_PLATEAU_RISE      : float = 65.0    # how high a mesa top can sit above the local base
+const MAX_CANYON_DEPTH      : float = 75.0    # how deep a slot canyon can cut
+const CAVE_BOTTOM_DEPTH     : float = 110.0
 const SEA_LEVEL_OFFSET      : float = -12.0   # terrain "0" sits this far above mean sea level
 
 var radius          : float = PLANET_RADIUS_DEFAULT
@@ -285,10 +290,10 @@ func sample(p: Vector3) -> float:
 	#   canyon    :  0..MAX_CANYON_DEPTH — subtracted to dig slot canyons
 	# Max additive ≈ 260 + 600 + 50 + 5 + 420 + 220 = 1555 m.
 	var height := (
-		continent * 260.0
+		continent * 75.0
 		+ ridge * MAX_TERRAIN_HEIGHT
-		+ hills * 50.0
-		+ detail * 5.0
+		+ hills * 14.0
+		+ detail * 1.5
 		+ spire * MAX_SPIRE_HEIGHT
 		+ plateau * MAX_PLATEAU_RISE
 		- canyon * MAX_CANYON_DEPTH
@@ -332,14 +337,14 @@ func gradient(p: Vector3, h: float = 1.0) -> Vector3:
 ##          ≤ 250 + 450 + 26 = 726
 ## plus a safety margin.
 func max_surface_radius() -> float:
-	# Strict upper bound on `height`. Continent post-bias max is 0.93*260 ≈ 242.
-	# Other layers: ridge 600 + hills 50 + detail 5 + spire 420 + plateau 220.
-	# Generous safety margin — undershooting here pops mountaintops in/out.
-	return radius + 242.0 + MAX_TERRAIN_HEIGHT + 50.0 + 5.0 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE + 150.0
+	# Strict upper bound on `height`. Continent post-bias max is 0.95*75 ≈ 71.
+	# Plus ridge + hills + detail + spire + plateau + safety margin (~50).
+	# Undershooting pops mountaintops in/out, so keep generous.
+	return radius + 71.0 + MAX_TERRAIN_HEIGHT + 14.0 + 1.5 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE + 50.0
 
 
 ## Cheap lower-bound radius (for the deepest possible carve).
 func min_surface_radius() -> float:
-	# Continent post-bias min is -1.17*260 ≈ -304 m. Plus canyon carving down
+	# Continent post-bias min is -1.25*75 ≈ -94 m. Plus canyon carving down
 	# to MAX_CANYON_DEPTH and cave carving below surface.
-	return radius - 304.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH
+	return radius - 94.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH

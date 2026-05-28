@@ -20,7 +20,7 @@ uniform vec3  sun_color            : source_color = vec3(1.0, 0.96, 0.86);
 
 uniform float wave_scale_a         : hint_range(0.0005, 0.1)  = 0.012;
 uniform float wave_scale_b         : hint_range(0.0005, 0.1)  = 0.034;
-uniform float wave_strength        : hint_range(0.0, 1.0)     = 0.25;
+uniform float wave_strength        : hint_range(0.0, 1.0)     = 0.03;
 uniform float wave_speed           : hint_range(0.0, 0.5)     = 0.06;
 uniform float fresnel_power        : hint_range(1.0, 8.0)     = 3.5;
 uniform float water_roughness      : hint_range(0.0, 1.0)     = 0.12;
@@ -66,11 +66,11 @@ float wave_field(vec3 p, float t) {
 void vertex() {
 	// Object-space position — invariant under the planet's orbit + spin.
 	v_obj_pos = VERTEX;
-	// Tiny NDC depth bias toward the camera so the water surface wins z-fights
-	// against terrain triangles that happen to land exactly at sea level. The
-	// shoreline noise generates lots of coincident geometry, so without this
-	// the shore shimmers as terrain and water swap depth ownership per pixel.
-	POSITION.z -= 0.00015 * POSITION.w;
+	// NOTE: a clip-space depth bias used to live here to win shoreline z-fights,
+	// but Godot 4 uses reverse-Z and at planetary distance that tiny NDC nudge
+	// maps to a huge world-space depth shift the WRONG way — it shoved the whole
+	// ocean sphere behind the terrain so it never drew. Removed; the surface now
+	// renders at its true depth.
 }
 
 

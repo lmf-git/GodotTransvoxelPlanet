@@ -1,0 +1,16 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.2
+reloadable = true
+
+[libraries]
+; Editor/debug runs point at the RELEASE (optimized) dylib too — the mesher is
+; pure compute and debug Rust is ~10-50× slower, which would make native
+; meshing feel slower than GDScript. Swap back to target/debug if you need to
+; debug the Rust itself.
+macos.debug = "res://rust/target/release/libtransvoxel_native.dylib"
+macos.release = "res://rust/target/release/libtransvoxel_native.dylib"
+linux.debug = "res://rust/target/debug/libtransvoxel_native.so"
+linux.release = "res://rust/target/release/libtransvoxel_native.so"
+windows.debug = "res://rust/target/debug/transvoxel_native.dll"
+windows.release = "res://rust/target/release/transvoxel_native.dll"

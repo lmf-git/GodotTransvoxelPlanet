@@ -72,13 +72,24 @@ func _build_camera_rig() -> void:
 	add_child(_spring)
 	_camera = Camera3D.new()
 	_camera.fov = 70.0
-	_camera.near = 0.1
-	_camera.far  = 200000.0   # planet + atmosphere visible
+	# near/far ratio matters a lot for projection-matrix stability — at far 2.5M
+	# the old 0.1 near made the ratio 25 million, which made Projection::get_endpoints
+	# (used by get_frustum() in planet.gd) fail with a singular-matrix error and
+	# spam the console. Raising near to 1.0 drops the ratio to 2.5M, which Godot
+	# handles cleanly. The spring-arm camera sits 8 m from the player so anything
+	# inside 1 m is occluded anyway.
+	_camera.near = 1.0
+	_camera.far  = 2500000.0  # covers the sun at orbit_radius 1.8M + radius 78k = 1.88M, with margin
 	_camera.current = true
 	# Camera looks back along its own -Z toward the player, which after the
 	# 180° spring rotation aligns with the player's forward direction.
 	_spring.add_child(_camera)
 	_camera.position = Vector3.ZERO
+	# The camera inherits the spring's 180° (it's a child), which makes it look
+	# in the player's +Z — i.e. BACKWARD, away from where the player faces (and
+	# away from the planet at spawn). Rotate the camera 180° to cancel that so it
+	# looks along the player's forward (-Z), the correct third-person view.
+	_camera.rotation = Vector3(0, PI, 0)
 
 
 func _unhandled_input(event: InputEvent) -> void:
