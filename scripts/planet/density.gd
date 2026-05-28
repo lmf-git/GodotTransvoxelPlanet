@@ -15,16 +15,14 @@ extends RefCounted
 ## thread without locking. FastNoiseLite is thread-safe for reads in Godot 4.
 
 const PLANET_RADIUS_DEFAULT : float = 4000.0
-# Scaled down ~3.5× for the 24 km planet — keeps mountains visible from a
-# distance without dominating the horizon. Both the Rust mesher and this
-# script MUST agree (Rust meshes the surface; this script is what the
-# player's altitude / surface-snap queries hit), so update density.rs in
-# lockstep with any change here.
-const MAX_TERRAIN_HEIGHT    : float = 170.0   # tallest possible mountain peak above mean radius
-const MAX_SPIRE_HEIGHT      : float = 120.0   # how tall the dramatic NMS-style pinnacles can get
-const MAX_PLATEAU_RISE      : float = 65.0    # how high a mesa top can sit above the local base
-const MAX_CANYON_DEPTH      : float = 75.0    # how deep a slot canyon can cut
-const CAVE_BOTTOM_DEPTH     : float = 110.0
+# Earth-scale dramatic peaks for the 24 km planet. Both the Rust mesher and
+# this script MUST agree (Rust meshes the surface; this script answers the
+# player's altitude / surface-snap queries), so update density.rs in lockstep.
+const MAX_TERRAIN_HEIGHT    : float = 900.0   # tallest possible mountain peak above mean radius
+const MAX_SPIRE_HEIGHT      : float = 520.0   # how tall the dramatic NMS-style pinnacles can get
+const MAX_PLATEAU_RISE      : float = 280.0   # how high a mesa top can sit above the local base
+const MAX_CANYON_DEPTH      : float = 320.0   # how deep a slot canyon can cut
+const CAVE_BOTTOM_DEPTH     : float = 420.0
 const SEA_LEVEL_OFFSET      : float = -12.0   # terrain "0" sits this far above mean sea level
 
 var radius          : float = PLANET_RADIUS_DEFAULT
@@ -198,7 +196,10 @@ func sample(p: Vector3) -> float:
 	# mean radius) without drowning the whole planet. Combined with mountains
 	# now being a rarer biome (less global positive height), low continents
 	# flood into seas while the highlands stay dry land.
-	continent = continent * 1.1 - 0.15
+	# Match Rust's density.rs formula exactly (×1.5, then bias) — they drifted
+	# apart, and the player's altitude queries (this script) were reporting a
+	# different surface height than the Rust mesh, causing under-/over-clipping.
+	continent = continent * 1.5 - 0.55
 
 	# Ridges only over land — mountains rise from the continents.
 	var land_mask := smoothstep(-0.05, 0.35, continent)
@@ -290,10 +291,10 @@ func sample(p: Vector3) -> float:
 	#   canyon    :  0..MAX_CANYON_DEPTH — subtracted to dig slot canyons
 	# Max additive ≈ 260 + 600 + 50 + 5 + 420 + 220 = 1555 m.
 	var height := (
-		continent * 75.0
+		continent * 380.0
 		+ ridge * MAX_TERRAIN_HEIGHT
-		+ hills * 14.0
-		+ detail * 1.5
+		+ hills * 65.0
+		+ detail * 6.0
 		+ spire * MAX_SPIRE_HEIGHT
 		+ plateau * MAX_PLATEAU_RISE
 		- canyon * MAX_CANYON_DEPTH
@@ -337,14 +338,14 @@ func gradient(p: Vector3, h: float = 1.0) -> Vector3:
 ##          ≤ 250 + 450 + 26 = 726
 ## plus a safety margin.
 func max_surface_radius() -> float:
-	# Strict upper bound on `height`. Continent post-bias max is 0.95*75 ≈ 71.
-	# Plus ridge + hills + detail + spire + plateau + safety margin (~50).
-	# Undershooting pops mountaintops in/out, so keep generous.
-	return radius + 71.0 + MAX_TERRAIN_HEIGHT + 14.0 + 1.5 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE + 50.0
+	# Strict upper bound on `height`. Continent post-bias max (noise=1) is
+	# 1*1.5-0.55 = 0.95 → 0.95*380 ≈ 361 m. Plus the other masked layers.
+	# Undershoot pops mountaintops in/out — keep generous.
+	return radius + 361.0 + MAX_TERRAIN_HEIGHT + 65.0 + 6.0 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE + 150.0
 
 
 ## Cheap lower-bound radius (for the deepest possible carve).
 func min_surface_radius() -> float:
-	# Continent post-bias min is -1.25*75 ≈ -94 m. Plus canyon carving down
-	# to MAX_CANYON_DEPTH and cave carving below surface.
-	return radius - 94.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH
+	# Continent post-bias min (noise=-1) is -1*1.5-0.55 = -2.05 → -2.05*380 ≈ -779 m.
+	# Plus canyon carving down to MAX_CANYON_DEPTH and cave carving below surface.
+	return radius - 779.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH

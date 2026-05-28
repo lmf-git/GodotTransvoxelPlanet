@@ -1,8 +1,19 @@
 // Planetary ocean — translucent sphere at sea level.
-// Wave-noise pattern in OBJECT space (so it stays anchored to the water sphere
-// instead of sweeping past as the planet orbits the sun), animated via TIME.
-// Lighting is computed in world space; the object-space normal is just
-// transformed at the end.
+//
+// Improvements vs. the previous version:
+//   * Multi-octave fbm wave field — long swells + chop + ripples, not a single
+//     scrolling noise that read as a uniform texture.
+//   * Stable tangent basis from a fixed reference (no view-dependent seed
+//     swap → no seam at the poles).
+//   * Wave HEIGHT no longer modulates the colour. Old shader mixed deep ↔
+//     shallow by wave height, which made the surface look spotted; deep water
+//     is now uniformly deep, and Fresnel toward a sky-tinted reflection
+//     lightens it at grazing angles instead of a flat grey mix.
+//   * Whitecap foam triggered by wave STEEPNESS (gradient magnitude), the way
+//     real wind-driven foam forms on wave crests — not by raw height.
+//   * Sun specular via Godot's standard SPECULAR/ROUGHNESS lighting plus an
+//     additional sharp glint emission gated by day-factor, so the highlight
+//     only fires on the lit hemisphere.
 
 shader_type spatial;
 // cull_disabled so the surface is visible from below water too.
@@ -10,24 +21,27 @@ render_mode blend_mix, depth_draw_opaque, cull_disabled, diffuse_burley, specula
 
 uniform vec3  planet_center        = vec3(0.0);
 uniform float planet_radius        : hint_range(100.0, 100000.0) = 4000.0;
-uniform float sea_level_offset     : hint_range(-200.0, 200.0)   = -12.0;
+uniform float sea_level_offset     : hint_range(-500.0, 500.0)   = -200.0;
 
-uniform vec3  shallow_color        : source_color = vec3(0.20, 0.55, 0.60);
-uniform vec3  deep_color           : source_color = vec3(0.02, 0.08, 0.18);
-uniform vec3  foam_color           : source_color = vec3(0.92, 0.95, 0.98);
+uniform vec3  shallow_color        : source_color = vec3(0.16, 0.56, 0.62);   // turquoise — coastal water
+uniform vec3  deep_color           : source_color = vec3(0.02, 0.08, 0.16);   // open ocean
+uniform vec3  sky_color            : source_color = vec3(0.45, 0.66, 0.94);   // colour reflected at grazing fresnel angles
+uniform vec3  foam_color           : source_color = vec3(0.94, 0.96, 0.98);
 uniform vec3  sun_direction        = vec3(0.6, 0.5, 0.4);
 uniform vec3  sun_color            : source_color = vec3(1.0, 0.96, 0.86);
+uniform vec3  polar_axis           = vec3(0.0, 1.0, 0.0);   // stable tangent reference
 
-uniform float wave_scale_a         : hint_range(0.0005, 0.1)  = 0.012;
-uniform float wave_scale_b         : hint_range(0.0005, 0.1)  = 0.034;
-uniform float wave_strength        : hint_range(0.0, 1.0)     = 0.03;
+uniform float wave_scale_swell     : hint_range(0.0001, 0.02) = 0.0018;
+uniform float wave_scale_chop      : hint_range(0.001, 0.05)  = 0.011;
+uniform float wave_scale_ripple    : hint_range(0.005, 0.5)   = 0.06;
+uniform float wave_strength        : hint_range(0.0, 1.5)     = 0.42;
 uniform float wave_speed           : hint_range(0.0, 0.5)     = 0.06;
-uniform float fresnel_power        : hint_range(1.0, 8.0)     = 3.5;
-uniform float water_roughness      : hint_range(0.0, 1.0)     = 0.12;
-uniform float specular_strength    : hint_range(0.0, 4.0)     = 1.2;
-uniform float specular_sharpness   : hint_range(4.0, 128.0)   = 28.0;
-uniform float foam_threshold       : hint_range(0.0, 30.0)    = 1.6;
-uniform float foam_softness        : hint_range(0.1, 10.0)    = 1.8;
+
+uniform float fresnel_power        : hint_range(1.0, 8.0)     = 4.0;
+uniform float water_roughness      : hint_range(0.0, 0.5)     = 0.06;
+uniform float sun_glint_strength   : hint_range(0.0, 6.0)     = 1.8;
+uniform float sun_glint_sharpness  : hint_range(8.0, 256.0)   = 64.0;
+uniform float foam_strength        : hint_range(0.0, 4.0)     = 1.2;
 
 varying vec3 v_obj_pos;
 
@@ -56,21 +70,21 @@ float vnoise(vec3 p) {
 		f.z);
 }
 
+// Three-octave wave field. Each octave drifts at a different speed and
+// direction so the surface reads as moving water, not a scrolling texture.
+// Swell is the dominant long-period rise/fall; chop adds wind-driven mid-
+// frequency; ripple is the high-freq surface roughness that gives sun glints
+// their characteristic glitter.
 float wave_field(vec3 p, float t) {
-	float a = vnoise(p * wave_scale_a + vec3(t, t * 0.7, -t * 0.3));
-	float b = vnoise(p * wave_scale_b - vec3(t * 1.1, -t * 0.5, t * 0.9));
-	return mix(a, b, 0.5);
+	float swell  = vnoise(p * wave_scale_swell  + vec3(t * 0.30, 0.0, t * 0.18));
+	float chop   = vnoise(p * wave_scale_chop   + vec3(-t * 0.65, t * 0.40, t * 0.55));
+	float ripple = vnoise(p * wave_scale_ripple + vec3(t * 1.20, t * 0.90, -t * 1.05));
+	return swell * 0.62 + chop * 0.28 + ripple * 0.10;
 }
 
 
 void vertex() {
-	// Object-space position — invariant under the planet's orbit + spin.
 	v_obj_pos = VERTEX;
-	// NOTE: a clip-space depth bias used to live here to win shoreline z-fights,
-	// but Godot 4 uses reverse-Z and at planetary distance that tiny NDC nudge
-	// maps to a huge world-space depth shift the WRONG way — it shoved the whole
-	// ocean sphere behind the terrain so it never drew. Removed; the surface now
-	// renders at its true depth.
 }
 
 
@@ -79,56 +93,70 @@ void fragment() {
 	vec3 up_obj = normalize(op);
 	float t = TIME * wave_speed;
 
-	float w0 = wave_field(op, t);
-	// Small finite-difference offsets — also in object space, scaled to the
-	// sphere's local units.
-	float h = 2.5;
-	float dx = wave_field(op + vec3(h, 0.0, 0.0), t) - w0;
-	float dz = wave_field(op + vec3(0.0, 0.0, h), t) - w0;
-
-	// Build a tangent basis on the sphere in object space, then perturb the
-	// outward normal by the gradient (smaller `wave_strength` → calmer water).
-	vec3 seed = vec3(0.0, 0.0, 1.0);
-	if (abs(up_obj.z) > 0.95) {
-		seed = vec3(1.0, 0.0, 0.0);
+	// Build a STABLE tangent basis using polar_axis as the reference rather
+	// than a view-dependent seed. Old code switched the seed at z>0.95,
+	// creating a visible seam across the pole. The fallback handles the
+	// degenerate case where up_obj is parallel to polar_axis.
+	vec3 ref = polar_axis;
+	if (abs(dot(up_obj, ref)) > 0.97) {
+		ref = vec3(1.0, 0.0, 0.0);
 	}
-	vec3 t_x = normalize(cross(up_obj, seed));
+	vec3 t_x = normalize(cross(up_obj, ref));
 	vec3 t_z = normalize(cross(up_obj, t_x));
+
+	float w0 = wave_field(op, t);
+	// Finite-difference along the tangent vectors (sphere surface), not along
+	// world axes — gives correct gradients regardless of where on the sphere
+	// the fragment is.
+	float h = 2.5;
+	float dx = wave_field(op + t_x * h, t) - w0;
+	float dz = wave_field(op + t_z * h, t) - w0;
+
+	// Perturb the outward normal by the wave gradient.
 	vec3 nrm_obj = normalize(up_obj + (t_x * dx + t_z * dz) * wave_strength);
 
-	// World-space versions for lighting / Fresnel.
+	// World-space versions for lighting.
 	vec3 nrm_world = normalize((MODEL_MATRIX * vec4(nrm_obj, 0.0)).xyz);
 	vec3 wp        = (MODEL_MATRIX * vec4(op, 1.0)).xyz;
 	vec3 view      = normalize(CAMERA_POSITION_WORLD - wp);
 	float n_dot_v  = clamp(dot(nrm_world, view), 0.0, 1.0);
+	// Schlick-style Fresnel — surface gets MORE reflective at grazing angles.
 	float fresnel  = pow(1.0 - n_dot_v, fresnel_power);
 
-	// Foam where wave noise spikes high.
-	float foam_t = smoothstep(0.55 + foam_threshold * 0.05,
-	                           0.85 + foam_threshold * 0.05, w0);
-	foam_t = clamp(foam_t / foam_softness, 0.0, 1.0);
+	// Wave STEEPNESS (gradient magnitude) — whitecaps form where the surface
+	// is sharply tilted, which is what makes wind-driven foam.
+	float steep = length(vec2(dx, dz)) * 60.0;
+	float foam_t = clamp(smoothstep(0.42, 0.95, steep) * foam_strength, 0.0, 1.0);
 
-	// Base color: deep ↔ shallow by wave noise, then foam.
-	vec3 base = mix(deep_color, shallow_color, w0);
-	base = mix(base, foam_color, foam_t);
+	// Base water colour: deep blue everywhere — does NOT depend on the wave
+	// height noise, which is what made the old surface look spotted. View-
+	// dependent transparency makes it read as shallow where the camera looks
+	// nearly straight down (light penetrates further), deep at grazing angles.
+	vec3 base = mix(shallow_color, deep_color, smoothstep(0.55, 0.92, 1.0 - n_dot_v));
 
-	// Sun specular — softened (lower sharpness, lower strength) so wave-noise
-	// jitter doesn't sparkle / flicker per frame.
-	// `sun_direction` is the direction FROM the sun (light propagation), so
-	// the vector pointing AT the sun from any surface point is `-sun_dir`.
+	// Fresnel reflection towards SKY colour (not grey). At grazing angles you
+	// see the sky reflected, not a fog patch.
+	vec3 reflected = sky_color;
+	vec3 col = mix(base, reflected, fresnel);
+
+	// Foam paints over both.
+	col = mix(col, foam_color, foam_t);
+
+	// Sharp sun specular glint — separate from Godot's standard specular so
+	// it can be made sharper than the BRDF allows, and gated by day-factor
+	// so it doesn't fire on the night side.
 	vec3 to_sun = -normalize(sun_direction);
 	vec3 half_v = normalize(view + to_sun);
-	float spec  = pow(max(dot(nrm_world, half_v), 0.0), specular_sharpness) * specular_strength;
+	float glint = pow(max(dot(nrm_world, half_v), 0.0), sun_glint_sharpness);
 	vec3 radial_world = normalize(wp - planet_center);
-	float day_factor  = smoothstep(-0.05, 0.3, dot(radial_world, to_sun));
-	spec *= day_factor;
+	float day_factor  = smoothstep(-0.05, 0.25, dot(radial_world, to_sun));
+	vec3 sun_glint    = sun_color * glint * sun_glint_strength * day_factor;
 
-	ALBEDO    = mix(base, vec3(0.6), fresnel * 0.4);
-	EMISSION  = sun_color * spec * 0.5;
-	ROUGHNESS = mix(water_roughness, water_roughness + 0.4, foam_t);
-	SPECULAR  = 0.5;
+	ALBEDO    = col;
+	EMISSION  = sun_glint;
+	ROUGHNESS = mix(water_roughness, water_roughness + 0.45, foam_t);
+	SPECULAR  = 0.55;
 	METALLIC  = 0.0;
-	// NORMAL is expected in view space — transform world → view.
 	NORMAL    = (VIEW_MATRIX * vec4(nrm_world, 0.0)).xyz;
 	ALPHA     = mix(0.95, 1.0, foam_t);
 }

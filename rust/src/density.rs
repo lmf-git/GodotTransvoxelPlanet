@@ -6,17 +6,16 @@
 
 use crate::noise::{Fractal, Noise};
 
-// Height budget cut ~3.5× for the 24 km planet, so mountains read at roughly
-// Earth-like proportions (Everest is ~0.14% of Earth's radius; 170 m / 24 km ≈
-// 0.7% — still gameplay-friendly but no longer cartoonishly tall on the
-// horizon). The proportional "continent" lift, ridge/spire amplitudes, and
-// cave depth all drop together so terrain features stay visually balanced
-// against each other.
-const MAX_TERRAIN_HEIGHT: f32 = 170.0;
-const MAX_SPIRE_HEIGHT: f32 = 120.0;
-const MAX_PLATEAU_RISE: f32 = 65.0;
-const MAX_CANYON_DEPTH: f32 = 75.0;
-const CAVE_BOTTOM_DEPTH: f32 = 110.0;
+// Earth-scale dramatic peaks: 900 m mountains read as a real range on the
+// horizon from the ground, and from orbit you can see ridges silhouette
+// against the sky. The previous 170 m budget was nearly flat. Continent +
+// canyon amplitudes follow so ocean basins are deep and continents have
+// genuine elevation variation, not just a thin crust of bumps.
+const MAX_TERRAIN_HEIGHT: f32 = 900.0;
+const MAX_SPIRE_HEIGHT: f32 = 520.0;
+const MAX_PLATEAU_RISE: f32 = 280.0;
+const MAX_CANYON_DEPTH: f32 = 320.0;
+const CAVE_BOTTOM_DEPTH: f32 = 420.0;
 
 /// Godot's `smoothstep`, including the reversed-edge case (e0 > e1) used by the
 /// cave carve.
@@ -83,11 +82,11 @@ impl PlanetDensity {
         let (psx, psy, psz) = (x + nx * w, y + ny * w, z + nz * w);
 
         let mut continent = self.continent.get_noise_3d(psx, psy, psz);
-        // More spread (×1.5) + lower mean (−0.3) so a good fraction of the
-        // planet drops below the sea sphere (radius − 12) and oceans form, like
-        // Earth. The hand-rolled noise has a different range than FastNoiseLite,
-        // so this is re-tuned; surface_radius_stats() reports the actual range.
-        continent = continent * 1.5 - 0.3;
+        // Wider spread + stronger negative bias so ~65–70% of the planet sits
+        // below sea level (Earth is ~71% ocean). With the bigger height budget,
+        // continents now have genuine elevation variation above water instead
+        // of squashed bumps barely peeking above sea.
+        continent = continent * 1.5 - 0.55;
 
         let land_mask = smoothstep(-0.05, 0.35, continent);
 
@@ -133,10 +132,10 @@ impl PlanetDensity {
         let canyon_raw = self.canyon.get_noise_3d(psx, psy, psz).abs();
         let canyon = (1.0 - canyon_raw).clamp(0.0, 1.0).powf(2.0) * canyon_mask;
 
-        let height = continent * 75.0
+        let height = continent * 380.0
             + ridge * MAX_TERRAIN_HEIGHT
-            + hills * 14.0
-            + detail * 1.5
+            + hills * 65.0
+            + detail * 6.0
             + spire * MAX_SPIRE_HEIGHT
             + plateau * MAX_PLATEAU_RISE
             - canyon * MAX_CANYON_DEPTH;

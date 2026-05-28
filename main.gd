@@ -5,7 +5,7 @@ extends Node3D
 ## and wires the planet's chunk streamer to the player's camera.
 
 const PLANET_RADIUS    : float = 24000.0   # ~3× previous; reads as a proper planet from orbit and gives the atmosphere shell real visual thickness
-const SPAWN_ALTITUDE   : float = 500.0   # safely above the highest possible terrain (max surface ≈ radius +470 m after the scaled-down height budget)
+const SPAWN_ALTITUDE   : float = 2500.0   # safely above the highest possible terrain (max surface ≈ radius +2130 m with the Earth-scale height budget)
 
 var world  : PlanetaryWorld
 var player : FlightPlayer

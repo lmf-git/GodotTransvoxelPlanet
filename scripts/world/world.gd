@@ -33,7 +33,7 @@ extends Node3D
 @export var atmosphere_radius : float = 4520.0
 @export var cloud_inner_radius : float = 4180.0   # bottom of the volumetric cloud deck
 @export var cloud_outer_radius : float = 4420.0   # top of the deck (inside the atmosphere shell)
-@export var sea_level_offset  : float = -80.0     # world units below planet_radius; tuned so land > ocean (terrain mean ≈ -100 m)
+@export var sea_level_offset  : float = -200.0    # SEA 200 m below planet_radius. Mean continent height with the -0.55 bias / 380 multiplier is around -209 m, so the previous offset of 0 left the average surface well under water — only noise>0.32 areas surfaced. -200 puts sea AT roughly the mean surface so ~50% of the planet is land, dropping below for ocean basins and rising into continents/mountains above.
 @export var world_seed        : int   = 1337
 
 @export var orbit_radius      : float = 1800000.0 # sun is far away (≈75× planet radius) — scaled with planet
@@ -380,8 +380,13 @@ func _build_planet_system() -> void:
 	# Toned down (was 1.6 / 0.55): the atmosphere halo was overpowering the
 	# surface and over-brightening the sky. Lower scattering keeps a believable
 	# horizon haze without washing everything out.
-	atmosphere_mat.set_shader_parameter("scattering_strength", 0.45)
-	atmosphere_mat.set_shader_parameter("mie_strength", 0.18)
+	# Bumped (was 0.45 / 0.18): from the ground the atmosphere was almost
+	# invisible — the user could see "through" the sky at distant terrain and
+	# the boundary at the top of the shell looked like a hard edge against
+	# space. 0.85 / 0.30 gives a proper visible blue sky from the ground while
+	# the lowered sun_energy (0.55) keeps the surface itself from over-brightening.
+	atmosphere_mat.set_shader_parameter("scattering_strength", 0.85)
+	atmosphere_mat.set_shader_parameter("mie_strength", 0.30)
 	# Concentric transparent shells (water < clouds < atmosphere) share the
 	# planet centre, so Godot can't depth-sort them by camera distance and
 	# their draw order flips frame-to-frame (the cloud/atmosphere flicker).
@@ -477,6 +482,14 @@ func _apply_initial_transforms() -> void:
 	# The terrain shader's polar_axis is in OBJECT space — constant for the
 	# life of the planet (it doesn't change as we orbit or spin).
 	terrain_mat.set_shader_parameter("polar_axis", _spin_axis_local.normalized())
+	# Hand the same axis to the rock-scatter material so its biome math
+	# (latitude, polar caps, beach altitude) matches the terrain underneath.
+	planet.set_scatter_axis(_spin_axis_local)
+	# Water uses polar_axis as a stable reference for its tangent-frame
+	# construction (the gradient sample directions on the sphere). Without
+	# it the shader falls back to a view-dependent seed and seams across the
+	# poles. Same constant object-space vector as terrain/rocks.
+	water_mat.set_shader_parameter("polar_axis", _spin_axis_local.normalized())
 	_update_transforms()
 
 
@@ -516,6 +529,11 @@ func _update_transforms() -> void:
 	if cloud_mat:
 		cloud_mat.set_shader_parameter("sun_direction", sun_to_planet)
 		cloud_mat.set_shader_parameter("planet_center", planet_system.global_position)
+		# Inverse of the planet's spin rotation. The cloud shader rotates the
+		# world-space sample position by this to get planet-LOCAL coords, so
+		# the noise pattern stays locked to the surface as the planet spins
+		# instead of whipping across the sky at the spin rate.
+		cloud_mat.set_shader_parameter("planet_basis_inv", planet_system.transform.basis.inverse())
 
 	# Moon — orbits the planet at moon_orbit_radius, inclined out of the
 	# orbital plane by moon_inclination_deg. Computed in doubles so the

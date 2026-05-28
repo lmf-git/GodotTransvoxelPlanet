@@ -16,12 +16,22 @@ render_mode unshaded, blend_mix, cull_disabled, depth_draw_never;
 
 uniform vec3  planet_center        = vec3(0.0);
 uniform float planet_radius        = 4000.0;
+// World→planet-local rotation. Needed because we sample the cloud noise at
+// `rel = wp - planet_center` in world space; but the planet spins under us
+// every frame, so `rel` for a fragment on the cloud sphere rotates around
+// the planet axis at the spin rate — which makes the noise pattern drift
+// across the cloud surface at SPIN speed, reading as "clouds moving fast
+// around the planet". Rotating `rel` by the inverse of the planet's basis
+// puts it in the planet's LOCAL frame, where the noise pattern is locked
+// to the planet so clouds stay put as it spins (which is what real clouds
+// look like — they move on timescales of hours, not minutes).
+uniform mat3  planet_basis_inv     = mat3(1.0);
 uniform float cloud_inner          = 4180.0;   // shell bottom radius
 uniform float cloud_outer          = 4420.0;   // shell top radius (== render sphere radius)
 uniform vec3  sun_direction        = vec3(0.6, 0.5, 0.4);   // direction light travels
 uniform vec3  sun_color   : source_color = vec3(1.0, 0.96, 0.86);
-uniform vec3  cloud_color : source_color = vec3(1.0, 1.0, 1.0);
-uniform vec3  cloud_shadow_color : source_color = vec3(0.42, 0.47, 0.60);
+uniform vec3  cloud_color : source_color = vec3(0.92, 0.93, 0.97);   // slightly cool white — pure (1,1,1) reads as paper-flat
+uniform vec3  cloud_shadow_color : source_color = vec3(0.10, 0.12, 0.18);  // much darker — was (0.42, 0.47, 0.60), too bright to read as shadow
 
 uniform float coverage     : hint_range(0.0, 1.0)    = 0.52;  // higher = fewer/smaller clouds; 0.62 was too sparse for the planet's size
 uniform float density_mul  : hint_range(0.0, 8.0)    = 1.6;   // lower → more translucent, less "thick fog"
@@ -80,12 +90,18 @@ float fbm(vec3 p) {
 float cloud_density(vec3 wp) {
 	vec3 rel = wp - planet_center;
 	float r = length(rel);
+	// Rotate into the planet's LOCAL frame for noise sampling so the cloud
+	// pattern doesn't morph at the planet's spin rate. Length is rotation-
+	// invariant, so `r` and the vertical-falloff math stay the same.
+	vec3 rel_local = planet_basis_inv * rel;
 	float mid = (cloud_inner + cloud_outer) * 0.5;
 	float half_span = max((cloud_outer - cloud_inner) * 0.5, 1.0);
 	// Soft vertical falloff so the deck thins toward the top and bottom.
 	float vfall = clamp(1.0 - abs(r - mid) / half_span, 0.0, 1.0);
 	vfall = smoothstep(0.0, 0.6, vfall);
-	vec3 sp = rel * cloud_scale + vec3(TIME * drift_speed, 0.0, TIME * drift_speed * 0.7);
+	// Drift in local frame — clouds move slowly relative to the ground
+	// (real-cloud timescale) instead of being yanked around by spin.
+	vec3 sp = rel_local * cloud_scale + vec3(TIME * drift_speed, 0.0, TIME * drift_speed * 0.7);
 	float base = fbm(sp);
 	// Layer in a higher-frequency detail noise that EATS INTO the base shape
 	// (subtracted, not added) — the "billow" technique: it carves ragged
@@ -93,7 +109,7 @@ float cloud_density(vec3 wp) {
 	// reading as smooth blobs. The detail is INTENTIONALLY NOT time-animated
 	// (drifting it caused clouds to flicker in/out at the coverage edge);
 	// only the low-freq base drifts, the detail texture is locked to space.
-	float detail = fbm(rel * detail_scale);
+	float detail = fbm(rel_local * detail_scale);
 	float n = base - detail_strength * (1.0 - detail);
 	// Wider coverage band → more partial-density edges instead of binary
 	// "cloud / no cloud", which is what reads as the flat-colour look.
@@ -150,6 +166,15 @@ void fragment() {
 	float dt = seg / float(steps);
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
+	// Henyey-Greenstein-ish forward-scatter lobe: clouds brighten when the
+	// view ray points roughly along the sun direction (e.g. looking up at a
+	// cloud lit from behind by the sun). Single G value, no normalisation —
+	// just a multiplier into the scattered colour.
+	float cos_view_sun = dot(rd, to_sun);
+	float g = 0.55;
+	float forward_lobe = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cos_view_sun, 1.5);
+	forward_lobe = clamp(forward_lobe, 0.5, 3.0);
+
 	float transmittance = 1.0;
 	vec3 scattered = vec3(0.0);
 	for (int i = 0; i < MAX_MARCH_STEPS; i++) {
@@ -158,18 +183,25 @@ void fragment() {
 		vec3 pos = ro + rd * t;
 		float dens = cloud_density(pos);
 		if (dens > 0.001) {
-			// Cheap self-shadow: accumulate density toward the sun.
+			// Multi-sample self-shadow: walk 4 steps toward the sun and
+			// accumulate density. Single-sample was the reason clouds came out
+			// uniformly bright — the body of a cloud blocks 4× more sun than
+			// its edge, but a single sample can't tell them apart.
 			float ls = 0.0;
-			for (int j = 1; j <= 1; j++) {
-				ls += cloud_density(pos + to_sun * light_step * float(j));
-			}
-			float light = exp(-ls * 0.5);
+			ls += cloud_density(pos + to_sun * light_step * 1.0);
+			ls += cloud_density(pos + to_sun * light_step * 2.5) * 0.7;
+			ls += cloud_density(pos + to_sun * light_step * 5.0) * 0.4;
+			// Strong attenuation: exp(-ls * 2.5) lets thick cloud bodies
+			// drive `light` to near-zero so they read as solid grey-blue
+			// shadow against the lit edges and rim.
+			float light = exp(-ls * 2.5);
 			float a = 1.0 - exp(-dens * dt);
-			// Vertical depth shading: darker, cooler base → brighter, warmer top,
-			// so the deck reads as volumetric instead of a flat one-colour sheet.
+			// Vertical depth shading: tops bright, bases dark, so flat sheets
+			// pick up volume cues even without strong sun direction.
 			float hf = clamp((length(pos - planet_center) - cloud_inner)
 					/ max(cloud_outer - cloud_inner, 1.0), 0.0, 1.0);
-			vec3 col = mix(cloud_shadow_color, cloud_color, light) * mix(0.6, 1.2, hf);
+			float vfactor = mix(0.45, 1.15, hf);
+			vec3 col = mix(cloud_shadow_color, cloud_color, light) * vfactor;
 			scattered += transmittance * a * col;
 			transmittance *= (1.0 - a);
 			if (transmittance < 0.02) {
@@ -177,16 +209,29 @@ void fragment() {
 			}
 		}
 	}
+	// Day/night dimming based on the shell mid-point's sun facing. Computed
+	// here (before the forward-scatter apply) so the lobe doesn't brighten
+	// clouds that aren't actually facing the sun.
+	vec3 mid_pos = ro + rd * ((t_enter + t_exit) * 0.5);
+	vec3 radial = normalize(mid_pos - planet_center);
+	float day = smoothstep(-0.25, 0.25, dot(radial, to_sun));
+	// Forward-scatter only counts on the LIT hemisphere — multiplying by
+	// `day` means a back-lit cloud on the night side doesn't get the bright
+	// sun-haloed edge it can't physically have.
+	scattered *= mix(1.0, forward_lobe, 0.35 * day);
 
 	float alpha = 1.0 - transmittance;
 	if (alpha < 0.01) {
 		discard;
 	}
-	// Day/night dimming based on the shell mid-point's sun facing.
-	vec3 mid_pos = ro + rd * ((t_enter + t_exit) * 0.5);
-	vec3 radial = normalize(mid_pos - planet_center);
-	float day = smoothstep(-0.25, 0.25, dot(radial, to_sun));
-	vec3 lit = scattered * sun_color * mix(0.12, 1.0, day);
+	// Dimmed: was * sun_color (≈1.0) * 1.0 in daylight which let the brightest
+	// edge pixels exceed the HDR glow threshold (1.5) and bloom into white blobs.
+	// 0.85 keeps the lit edges crisp but stays under threshold; night side is
+	// pushed nearly to black (was floored at 0.08 of full brightness which read
+	// as "clouds still lit at midnight"). The 0.015 floor is a tiny ambient so
+	// they don't go pitch black against the deep-space backdrop — closer to
+	// what real clouds look like under moon/starlight.
+	vec3 lit = scattered * sun_color * max(day * 0.85, 0.015);
 
 	ALBEDO = lit / max(alpha, 0.001);
 	ALPHA = alpha;

@@ -8,7 +8,13 @@
 // soft Mie sun-direction lobe.
 
 shader_type spatial;
-render_mode unshaded, blend_mix, cull_front, depth_draw_never, depth_test_disabled;
+// cull_disabled (was cull_front): from inside the shell — flying near the
+// ground after crossing the upper atmosphere boundary — cull_front was
+// silently dropping the inside-facing geometry on certain view angles
+// because the back-face-vs-camera test got flipped at large distances. With
+// cull_disabled both sides always rasterise; the shader's ray-sphere math
+// already handles inside vs outside correctly.
+render_mode unshaded, blend_mix, cull_disabled, depth_draw_never, depth_test_disabled;
 
 // DEPTH_TEXTURE lets us sample the already-rendered scene depth, so we can
 // clip the atmosphere integration at the actual surface (terrain / water /

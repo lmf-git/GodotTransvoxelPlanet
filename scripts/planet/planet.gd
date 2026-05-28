@@ -146,6 +146,7 @@ func _process(_dt: float) -> void:
 	_update_neighbor_masks()
 	_drain_pending_load()
 	_poll_native()
+	_update_scatter_material_uniforms()
 	# 2:1-violation stat is expensive — refresh it ~twice a second, not per frame.
 	_violation_frame += 1
 	if _violation_frame >= 30:
@@ -153,6 +154,26 @@ func _process(_dt: float) -> void:
 		_cached_violations = _count_balance_violations()
 	stats_changed.emit(_chunks.size(), _pending_load.size() + _pending_remesh.size(),
 			_total_tris, _cached_violations)
+
+
+# Push planet-world transform into the rock material so its biome math runs
+# in the planet's local frame (rotation-invariant under spin, position-correct
+# under orbit). planet_radius + polar_axis are static and set in `set_scatter_axis()`.
+func _update_scatter_material_uniforms() -> void:
+	if _scatter_material == null or not (_scatter_material is ShaderMaterial):
+		return
+	var sm := _scatter_material as ShaderMaterial
+	sm.set_shader_parameter("planet_center", global_position)
+	sm.set_shader_parameter("planet_basis_inv", global_transform.basis.inverse())
+
+
+## Called by world.gd after the planet is constructed — sets the static
+## uniforms on the rock material (polar axis in object space, base radius).
+func set_scatter_axis(polar_axis_object: Vector3) -> void:
+	if _scatter_material != null and _scatter_material is ShaderMaterial:
+		var sm := _scatter_material as ShaderMaterial
+		sm.set_shader_parameter("polar_axis", polar_axis_object.normalized())
+		sm.set_shader_parameter("planet_radius", planet_radius)
 
 
 # Collect finished meshes from the native thread pool and route each back to
