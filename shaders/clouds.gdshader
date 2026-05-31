@@ -156,14 +156,15 @@ void fragment() {
 	if (outer.y < 0.0) {
 		discard;
 	}
-	vec2 inner = ray_sphere(ro, rd, planet_center, cloud_inner);
 	float t_enter = max(outer.x, 0.0);
 	float t_exit  = outer.y;
-	// If the ray dips into the inner (below-cloud) sphere, stop the march
-	// there — we only render the near crossing of the deck.
-	if (inner.x > t_enter && inner.x < t_exit) {
-		t_exit = inner.x;
-	}
+	// NOTE: we deliberately do NOT clip the far exit at the inner (below-cloud)
+	// sphere. A horizon ray from above the deck crosses the deck TWICE — a near
+	// slab and a far slab — and that far slab IS the distant clouds along the
+	// horizon. Clipping at the inner near-crossing dropped them (they only
+	// appeared once you dropped below the deck). Marching the whole cloud_outer
+	// chord keeps both slabs; the depth clip below already stops the march at the
+	// real surface, so we never march through the planet.
 	// Clip the march at the real scene surface (terrain/water) reconstructed from
 	// the depth buffer. Godot uses reverse-Z (depth 0 = infinity / no occluder).
 	// This is what makes clouds render correctly in front of / around peaks that
@@ -189,8 +190,14 @@ void fragment() {
 	// as you moved toward/away from the planet. A constant step keeps the samples
 	// stable; the count just follows the segment length, capped for cost. Very
 	// long grazing chords stretch dt so they're still covered in MAX steps.
-	float dt = max((cloud_outer - cloud_inner) / 7.0, seg / float(MAX_MARCH_STEPS));
+	// Finer fixed step (deck/14 ≈ 2× the samples) so flying through reads as smooth
+	// parallax instead of blocky chunks sliding across the noise. Per-pixel jitter
+	// dithers the sample positions so the ±1 change in step COUNT (as the segment
+	// length changes while you move) breaks into fine noise rather than a coherent
+	// whole-screen pop — the "clouds regenerate as I move" artifact.
+	float dt = max((cloud_outer - cloud_inner) / 14.0, seg / float(MAX_MARCH_STEPS));
 	int steps = int(clamp(ceil(seg / dt), 1.0, float(MAX_MARCH_STEPS)));
+	float jitter = hash3(vec3(FRAGCOORD.xy, 11.7)) - 0.5;
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
 	// Henyey-Greenstein-ish forward-scatter lobe: clouds brighten when the
@@ -206,7 +213,7 @@ void fragment() {
 	vec3 scattered = vec3(0.0);
 	for (int i = 0; i < MAX_MARCH_STEPS; i++) {
 		if (i >= steps) { break; }
-		float t = t_enter + (float(i) + 0.5) * dt;
+		float t = t_enter + (float(i) + 0.5 + jitter) * dt;
 		vec3 pos = ro + rd * t;
 		float dens = cloud_density(pos);
 		if (dens > 0.001) {
@@ -227,7 +234,7 @@ void fragment() {
 			// pick up volume cues even without strong sun direction.
 			float hf = clamp((length(pos - planet_center) - cloud_inner)
 					/ max(cloud_outer - cloud_inner, 1.0), 0.0, 1.0);
-			float vfactor = mix(0.45, 1.15, hf);
+			float vfactor = mix(0.55, 1.35, hf);   // brighter tops (seen from above)
 			vec3 col = mix(cloud_shadow_color, cloud_color, light) * vfactor;
 			scattered += transmittance * a * col;
 			transmittance *= (1.0 - a);
@@ -258,7 +265,10 @@ void fragment() {
 	// as "clouds still lit at midnight"). The 0.015 floor is a tiny ambient so
 	// they don't go pitch black against the deep-space backdrop — closer to
 	// what real clouds look like under moon/starlight.
-	vec3 lit = scattered * sun_color * max(day * 0.85, 0.015);
+	// Brightened 0.85 → 1.15 so daylit cloud tops (what you see from above) read
+	// bright instead of grey. The brightest edges may now just tip the bloom
+	// threshold, which on clouds reads as a soft sunlit rim rather than a blob.
+	vec3 lit = scattered * sun_color * max(day * 1.15, 0.02);
 
 	ALBEDO = lit / max(alpha, 0.001);
 	ALPHA = alpha;

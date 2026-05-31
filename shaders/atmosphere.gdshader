@@ -116,7 +116,11 @@ void fragment() {
 			            * scattering_strength * day;
 
 			out_col = rayleigh + mie + sunset;
-			out_a   = clamp(max(optical_depth * 0.55, space_alpha), 0.0, 1.0);
+			// Cap the haze opacity below 1.0 so the long horizon path never becomes
+			// FULLY opaque — otherwise the atmosphere paints solid over the distant
+			// cloud deck and it looks hard-clipped at the horizon line. Capping lets
+			// the far clouds/terrain fade through the haze instead.
+			out_a   = clamp(max(optical_depth * 0.55, space_alpha), 0.0, 0.82);
 			// Let the bright sun disc punch THROUGH the shell (no blue/orange veil).
 			float sun_prox = smoothstep(0.985, 0.9999, cos_a);
 			out_a *= (1.0 - 0.92 * sun_prox);

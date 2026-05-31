@@ -481,15 +481,23 @@ func _build_planet_system() -> void:
 	# so it works from orbit, inside the deck, or on the ground looking up.
 	clouds = MeshInstance3D.new()
 	clouds.name = "Clouds"
+	# TRIGGER mesh, larger than the actual deck. The shader clips the view ray to
+	# [cloud_inner, cloud_outer] for the real cloud volume, so an oversized mesh
+	# doesn't change the clouds — it just keeps the camera INSIDE the mesh while
+	# it's near/just-above the deck top. Rendering on a sphere right at cloud_outer
+	# meant that hovering around that altitude crossed the mesh surface, so looking
+	# up clipped it away and the clouds blinked out. A 1.6× trigger pushes that
+	# crossing far above normal flight.
+	var cloud_trigger := cloud_outer_radius * 1.6
 	var cmesh := SphereMesh.new()
-	cmesh.radius = cloud_outer_radius
-	cmesh.height = cloud_outer_radius * 2.0
+	cmesh.radius = cloud_trigger
+	cmesh.height = cloud_trigger * 2.0
 	cmesh.radial_segments = 64
 	cmesh.rings = 32
 	clouds.mesh = cmesh
 	clouds.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	clouds.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
-	clouds.extra_cull_margin = cloud_outer_radius
+	clouds.extra_cull_margin = cloud_trigger
 	cloud_mat = ShaderMaterial.new()
 	cloud_mat.shader = load("res://shaders/clouds.gdshader")
 	cloud_mat.set_shader_parameter("planet_center", Vector3.ZERO)
