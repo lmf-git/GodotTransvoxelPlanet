@@ -68,6 +68,20 @@ impl PlanetDensity {
         }
     }
 
+    /// Strict upper bound on the displaced surface radius — used by chunk
+    /// culling. Must over-estimate `surface_r` over all directions or the octree
+    /// culls chunks holding visible peaks. Mirrors density.gd::max_surface_radius.
+    pub fn max_surface_radius(&self) -> f32 {
+        self.radius + 361.0 + MAX_TERRAIN_HEIGHT + 65.0 + 6.0 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE
+            + 150.0
+    }
+
+    /// Strict lower bound on the surface radius (deepest possible carve).
+    /// Mirrors density.gd::min_surface_radius.
+    pub fn min_surface_radius(&self) -> f32 {
+        self.radius - 779.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH
+    }
+
     /// Density at a world-space point. Positive = solid (inside the planet).
     pub fn sample(&self, x: f32, y: f32, z: f32) -> f32 {
         let r = (x * x + y * y + z * z).sqrt();

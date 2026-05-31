@@ -12,7 +12,16 @@
 // toward the sun is `-sun_direction`).
 
 shader_type spatial;
-render_mode unshaded, blend_mix, cull_disabled, depth_draw_never;
+// depth_test_disabled: we no longer let the render sphere's hardware depth test
+// occlude the deck — that's what hard-clipped clouds around mountains that poke
+// above cloud_outer (the sphere surface intersected terrain). Instead we sample
+// the scene depth and clip the RAYMARCH at the real surface, so the deck renders
+// volumetrically in front of terrain with no sphere-intersection seam.
+render_mode unshaded, blend_mix, cull_disabled, depth_draw_never, depth_test_disabled;
+
+// Already-rendered scene depth, to clip the march at the actual terrain/water
+// surface (same technique as atmosphere.gdshader).
+uniform sampler2D depth_tex : hint_depth_texture, repeat_disable, filter_nearest;
 
 uniform vec3  planet_center        = vec3(0.0);
 uniform float planet_radius        = 4000.0;
@@ -44,7 +53,7 @@ uniform float drift_speed  : hint_range(0.0, 0.05)   = 0.004;
 // fixed count — dynamic loop *bounds* can trip Metal's SPIR-V→MSL converter, so
 // instead we keep this bound fixed and `break` early (a dynamic break is fine).
 // Proximity LOD picks the actual sample count per-pixel from the view distance.
-const int MAX_MARCH_STEPS = 16;
+const int MAX_MARCH_STEPS = 20;
 
 varying vec3 v_world;
 
@@ -96,9 +105,12 @@ float cloud_density(vec3 wp) {
 	vec3 rel_local = planet_basis_inv * rel;
 	float mid = (cloud_inner + cloud_outer) * 0.5;
 	float half_span = max((cloud_outer - cloud_inner) * 0.5, 1.0);
-	// Soft vertical falloff so the deck thins toward the top and bottom.
+	// Soft vertical falloff so the deck thins toward the top and bottom. The ramp
+	// is shortened (0.6 → 0.25) so density reaches full over the middle ~75% of
+	// the deck and only fades in the outer slivers — otherwise the clouds melted
+	// away just above/below you whenever you were inside the deck.
 	float vfall = clamp(1.0 - abs(r - mid) / half_span, 0.0, 1.0);
-	vfall = smoothstep(0.0, 0.6, vfall);
+	vfall = smoothstep(0.0, 0.25, vfall);
 	// Drift in local frame — clouds move slowly relative to the ground
 	// (real-cloud timescale) instead of being yanked around by spin.
 	vec3 sp = rel_local * cloud_scale + vec3(TIME * drift_speed, 0.0, TIME * drift_speed * 0.7);
@@ -152,18 +164,33 @@ void fragment() {
 	if (inner.x > t_enter && inner.x < t_exit) {
 		t_exit = inner.x;
 	}
+	// Clip the march at the real scene surface (terrain/water) reconstructed from
+	// the depth buffer. Godot uses reverse-Z (depth 0 = infinity / no occluder).
+	// This is what makes clouds render correctly in front of / around peaks that
+	// poke above the deck instead of being clipped by the render sphere.
+	float scene_depth_ndc = texture(depth_tex, SCREEN_UV).r;
+	if (scene_depth_ndc > 0.0) {
+		vec4 ndc = vec4(SCREEN_UV * 2.0 - 1.0, scene_depth_ndc, 1.0);
+		ndc.y = -ndc.y;   // SCREEN_UV is top-left origin
+		vec4 vpos = INV_PROJECTION_MATRIX * ndc;
+		vpos.xyz /= vpos.w;
+		vec4 wp_v = INV_VIEW_MATRIX * vec4(vpos.xyz, 1.0);
+		t_exit = min(t_exit, length(wp_v.xyz - ro));
+	}
 	if (t_exit <= t_enter) {
 		discard;
 	}
 
 	vec3 to_sun = -normalize(sun_direction);
-	// Proximity LOD: many samples when the deck is close (flying through it),
-	// few when it's a thin distant band from orbit (where it covers the whole
-	// screen and each step is a full-screen cost). `t_enter` is the view-space
-	// distance to where the ray first hits the deck.
-	int steps = int(clamp(8000.0 / max(t_enter, 1.0), 5.0, float(MAX_MARCH_STEPS)));
 	float seg = t_exit - t_enter;
-	float dt = seg / float(steps);
+	// Fixed WORLD-space march step — NOT a distance-based step COUNT. The old
+	// proximity LOD changed the number of samples with camera distance, so `dt`
+	// changed and the cloud sampling (hence the whole cloud shape) visibly morphed
+	// as you moved toward/away from the planet. A constant step keeps the samples
+	// stable; the count just follows the segment length, capped for cost. Very
+	// long grazing chords stretch dt so they're still covered in MAX steps.
+	float dt = max((cloud_outer - cloud_inner) / 7.0, seg / float(MAX_MARCH_STEPS));
+	int steps = int(clamp(ceil(seg / dt), 1.0, float(MAX_MARCH_STEPS)));
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
 	// Henyey-Greenstein-ish forward-scatter lobe: clouds brighten when the

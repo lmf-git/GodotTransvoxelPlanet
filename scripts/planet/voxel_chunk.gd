@@ -47,6 +47,10 @@ var _scatter_mmi   : MultiMeshInstance3D
 var _pending       : bool = false   # a native mesh job is in flight
 var _alive         : bool = true
 var _has_mesh      : bool = false
+# Triangle count of the currently-applied mesh. Set here at apply time (we
+# already have the index array) so the planet doesn't have to read the whole
+# mesh back out with surface_get_arrays() just to count it.
+var tri_count      : int  = 0
 
 
 func setup(
@@ -86,7 +90,7 @@ func request_build() -> void:
 	_last_built_mask = transition_mask
 	native.call("submit_chunk", get_instance_id(), world_seed,
 		float(planet_radius_for_scatter), origin, size, resolution,
-		transition_mask, planet_center)
+		transition_mask, planet_center, build_collision)
 
 
 # Called by the planet octree when this chunk's native mesh is ready.
@@ -109,13 +113,6 @@ func set_transition_mask(mask: int) -> bool:
 	return _has_mesh and mask != _last_built_mask
 
 
-# True if the chunk has a mesh but the last mesh was built with a different
-# mask than the current one (i.e. neighbour LODs have changed and we need
-# to re-mesh to keep the boundary crack-free).
-func needs_remesh_for_mask() -> bool:
-	return _has_mesh and transition_mask != _last_built_mask
-
-
 # "My currently DISPLAYED mesh isn't consistent with my current transition mask"
 # — either a mesh job is in flight (the new mesh hasn't been applied yet) or the
 # mask changed and no job is queued yet. Used by the atomic-swap gate so old
@@ -132,11 +129,14 @@ func _apply_mesh(result: Dictionary) -> void:
 	var empty     : bool               = result.get("empty", true)
 
 	if empty or indices.size() == 0:
+		tri_count = 0
 		_ensure_mesh_instance()
 		_mesh_instance.mesh = null
 		_remove_collision()
 		return
 
+	@warning_ignore("integer_division")
+	tri_count = indices.size() / 3
 	_ensure_mesh_instance()
 	var mesh := ArrayMesh.new()
 	var arr := []
@@ -158,11 +158,10 @@ func _apply_mesh(result: Dictionary) -> void:
 		if shape == null:
 			shape = ConcavePolygonShape3D.new()
 			_coll_shape.shape = shape
-		var faces := PackedVector3Array()
-		faces.resize(indices.size())
-		for i in indices.size():
-			faces[i] = positions[indices[i]]
-		shape.set_faces(faces)
+		# The worker already de-indexed the triangle soup for us (only for chunks
+		# that asked, via build_collision), so we no longer gather it per-index on
+		# the main thread.
+		shape.set_faces(result.get("collision_faces", PackedVector3Array()))
 	else:
 		_remove_collision()
 
@@ -190,16 +189,12 @@ func _update_scatter(positions: PackedVector3Array, normals: PackedVector3Array,
 		return
 	_ensure_scatter_mmi()
 	var mm : MultiMesh = _scatter_mmi.multimesh
-	mm.instance_count = 0   # reset before resizing
 	mm.instance_count = count
-	for i in count:
-		var b := i * 12
-		var inst_basis := Basis(
-			Vector3(xforms[b + 0], xforms[b + 4], xforms[b + 8]),
-			Vector3(xforms[b + 1], xforms[b + 5], xforms[b + 9]),
-			Vector3(xforms[b + 2], xforms[b + 6], xforms[b + 10]))
-		var inst_origin := Vector3(xforms[b + 3], xforms[b + 7], xforms[b + 11])
-		mm.set_instance_transform(i, Transform3D(inst_basis, inst_origin))
+	# build_rock_transforms already lays each instance out as 12 floats in the
+	# exact MultiMesh TRANSFORM_3D buffer order (3 rows of 4), so we can hand the
+	# whole array over in one assignment instead of rebuilding a Basis +
+	# Transform3D and calling set_instance_transform() per rock.
+	mm.buffer = xforms
 	_scatter_mmi.visible = true
 
 

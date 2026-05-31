@@ -1,13 +1,10 @@
-//! Hand-rolled marching-cubes mesher with crack-free LOD seams via boundary
-//! resampling. No external mesher crate. Operates on a density grid sampled
+//! Hand-rolled marching-cubes mesher with crack-free LOD seams via Transvoxel
+//! transition cells. No external mesher crate. Operates on a density grid sampled
 //! from `PlanetDensity`; `coarser_mask` marks faces whose neighbour is COARSER.
-//! On those faces the boundary samples are snapped onto the coarse grid before
-//! MC, so the fine chunk's face surface coincides with the coarse neighbour's
-//! (no gap; a subtle normal/shading seam is the only cost). The Transvoxel
-//! transition-cell code is kept below (dead) for a future true-Transvoxel path.
+//! On those faces the regular MC boundary is carved inward by a slab and the slab
+//! is filled with transition cells whose low-res face matches the coarse
+//! neighbour exactly and whose high-res face matches the carved regular mesh.
 //! Returns flat position/normal arrays and triangle indices.
-
-#![allow(dead_code)] // transition-cell helpers kept for a future true-Transvoxel path
 
 use crate::density::PlanetDensity;
 use crate::tables;
@@ -38,10 +35,22 @@ const E_DCI: [usize; 12] = [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0];
 const E_DCJ: [usize; 12] = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0];
 const E_DCK: [usize; 12] = [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1];
 
+// Transition cells were emitted double-sided as a safety net while their winding
+// was unverified: a winding mistake can't make a double-sided face invisible, it
+// just costs 2× transition triangles (a minority of the mesh). Set this to false
+// to emit them single-sided (winding = Lengyel `flip_winding` XOR face side). If
+// the transition surfaces then render inside-out, invert the parity in
+// emit_transition_cell. Kept true by default until visually confirmed watertight.
+const TRANSITION_DOUBLE_SIDED: bool = true;
+
 pub struct MeshData {
     pub positions: Vec<f32>,
     pub normals: Vec<f32>,
     pub indices: Vec<i32>,
+    /// De-indexed triangle soup (flat x,y,z per vertex) for ConcavePolygonShape3D.
+    /// Empty unless `want_collision` was set — only near chunks need it, and
+    /// building it here keeps it off the main thread.
+    pub collision_faces: Vec<f32>,
 }
 
 pub fn build(
@@ -50,6 +59,7 @@ pub fn build(
     resolution: usize,
     coarser_mask: i32,
     planet_center: [f32; 3],
+    want_collision: bool,
     density: &PlanetDensity,
 ) -> MeshData {
     let origin = V3::new(origin[0], origin[1], origin[2]);
@@ -76,7 +86,9 @@ pub fn build(
     // not by boundary resampling.)
 
     if !has_surface(&d) {
-        return MeshData { positions: vec![], normals: vec![], indices: vec![] };
+        return MeshData {
+            positions: vec![], normals: vec![], indices: vec![], collision_faces: vec![],
+        };
     }
 
     // ── 2. Per-corner gradients on the (R+1)^3 corner grid ──────────────────
@@ -207,7 +219,21 @@ pub fn build(
         out_nrm.push(n.x); out_nrm.push(n.y); out_nrm.push(n.z);
     }
 
-    MeshData { positions: out_pos, normals: out_nrm, indices }
+    // De-index into a triangle soup for collision, only when asked (near chunks).
+    let collision_faces = if want_collision {
+        let mut cf = Vec::with_capacity(indices.len() * 3);
+        for &idx in &indices {
+            let i = idx as usize;
+            cf.push(out_pos[3 * i]);
+            cf.push(out_pos[3 * i + 1]);
+            cf.push(out_pos[3 * i + 2]);
+        }
+        cf
+    } else {
+        Vec::new()
+    };
+
+    MeshData { positions: out_pos, normals: out_nrm, indices, collision_faces }
 }
 
 fn has_surface(d: &[f32]) -> bool {
@@ -216,58 +242,6 @@ fn has_surface(d: &[f32]) -> bool {
     }
     let first = d[0] > 0.0;
     d.iter().any(|&v| (v > 0.0) != first)
-}
-
-// Array index of a boundary-plane sample at face tangent coords (j, k).
-#[inline]
-fn arr_idx_on_face(axis: usize, fixed_arr: usize, u_axis: usize, v_axis: usize,
-                   j: usize, k: usize, gs: usize, gs2: usize) -> usize {
-    let mut a = [0usize; 3];
-    a[axis] = fixed_arr;
-    a[u_axis] = j + 1; // +1 for the halo layer
-    a[v_axis] = k + 1;
-    a[0] + a[1] * gs + a[2] * gs2
-}
-
-// Resample the boundary plane on each coarser-neighbour face onto the coarse
-// grid: coarse-aligned samples (even j,k) are kept; samples with an odd index
-// become the linear (one odd) or bilinear (both odd) blend of their coarse
-// neighbours. The fine chunk's face iso-surface then matches the coarse
-// neighbour's exactly.
-fn resample_boundary(d: &mut [f32], gs: usize, gs2: usize, resolution: usize, coarser_mask: i32) {
-    for face_bit in 0..6 {
-        if (coarser_mask & (1 << face_bit)) == 0 {
-            continue;
-        }
-        let axis = face_bit / 2;
-        let side = face_bit & 1;
-        let u_axis = (axis + 1) % 3;
-        let v_axis = (axis + 2) % 3;
-        let fixed_arr = 1 + if side == 1 { resolution } else { 0 };
-        for j in 0..=resolution {
-            for k in 0..=resolution {
-                let j_odd = j & 1 == 1;
-                let k_odd = k & 1 == 1;
-                if !j_odd && !k_odd {
-                    continue; // coarse-aligned — leave as-is
-                }
-                let target = arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j, k, gs, gs2);
-                let new_val = if j_odd && !k_odd {
-                    0.5 * (d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j - 1, k, gs, gs2)]
-                         + d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j + 1, k, gs, gs2)])
-                } else if k_odd && !j_odd {
-                    0.5 * (d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j, k - 1, gs, gs2)]
-                         + d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j, k + 1, gs, gs2)])
-                } else {
-                    0.25 * (d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j - 1, k - 1, gs, gs2)]
-                          + d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j + 1, k - 1, gs, gs2)]
-                          + d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j - 1, k + 1, gs, gs2)]
-                          + d[arr_idx_on_face(axis, fixed_arr, u_axis, v_axis, j + 1, k + 1, gs, gs2)])
-                };
-                d[target] = new_val;
-            }
-        }
-    }
 }
 
 fn emit_edge_vertex(
@@ -395,7 +369,7 @@ fn process_transition_face(
     while fu + 2 <= resolution {
         let mut fv = 0;
         while fv + 2 <= resolution {
-            emit_transition_cell(axis, u_axis, v_axis, fixed_chunk, inward_off,
+            emit_transition_cell(axis, u_axis, v_axis, side, fixed_chunk, inward_off,
                                  fu, fv, d, gs, gs2, voxel, origin,
                                  grad, cs, cs2, density, positions, normals, indices);
             fv += 2;
@@ -405,7 +379,7 @@ fn process_transition_face(
 }
 
 fn emit_transition_cell(
-    axis: usize, u_axis: usize, v_axis: usize, fixed_chunk: usize, inward_off: V3,
+    axis: usize, u_axis: usize, v_axis: usize, side: usize, fixed_chunk: usize, inward_off: V3,
     fu: usize, fv: usize,
     d: &[f32], gs: usize, gs2: usize, voxel: f32, origin: V3,
     grad: &[V3], cs: usize, cs2: usize, density: &PlanetDensity,
@@ -470,10 +444,7 @@ fn emit_transition_cell(
     cgrad[11] = coarse_resolution_gradient(cpos[11], density, coarse_h);
     cgrad[12] = coarse_resolution_gradient(cpos[12], density, coarse_h);
 
-    // Emit every vertex fresh (no reuse cache) and double-side every triangle.
-    // Correctness-first: no cache means no slot-indexing bugs, and double-siding
-    // means a winding mistake can't turn the transition mesh into an invisible
-    // (back-faced) gap. Reinstate caching + single-siding once it's watertight.
+    // Emit every vertex fresh (no reuse cache — no slot-indexing bugs).
     let mut local_verts = [0i32; 13];
     for vi in 0..vertex_count {
         let edge_code = tables::VERTEX_DATA[case_code * 12 + vi];
@@ -486,13 +457,23 @@ fn emit_transition_cell(
         local_verts[vi] = emit_transition_vertex(t, ca, cb, &cpos, &cgrad, positions, normals);
     }
 
-    let _ = flip_winding; // winding handled by double-siding for now
+    // Single-sided winding = Lengyel `flip_winding` XOR the face side; the −/+
+    // faces of the slab point opposite ways. Invert this `flip` if transition
+    // surfaces render inside-out. Double-sided (default) ignores winding by
+    // emitting both orders.
+    let flip = flip_winding ^ (side == 1);
     for ti in 0..triangle_count {
         let i0 = local_verts[class_indices[ti * 3] as usize];
         let i1 = local_verts[class_indices[ti * 3 + 1] as usize];
         let i2 = local_verts[class_indices[ti * 3 + 2] as usize];
-        indices.push(i0); indices.push(i1); indices.push(i2);
-        indices.push(i0); indices.push(i2); indices.push(i1);
+        if TRANSITION_DOUBLE_SIDED {
+            indices.push(i0); indices.push(i1); indices.push(i2);
+            indices.push(i0); indices.push(i2); indices.push(i1);
+        } else if flip {
+            indices.push(i0); indices.push(i2); indices.push(i1);
+        } else {
+            indices.push(i0); indices.push(i1); indices.push(i2);
+        }
     }
 }
 

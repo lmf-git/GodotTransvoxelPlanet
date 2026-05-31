@@ -41,10 +41,15 @@ uniform float lod_near             : hint_range(1.0, 500.0)   = 30.0;   // metre
 uniform float lod_far              : hint_range(100.0, 8000.0)= 1800.0; // metres: detail ramp-in is off beyond this
 
 uniform float fresnel_power        : hint_range(1.0, 8.0)     = 4.0;
-uniform float water_roughness      : hint_range(0.0, 0.5)     = 0.06;
-uniform float sun_glint_strength   : hint_range(0.0, 6.0)     = 1.8;
-uniform float sun_glint_sharpness  : hint_range(8.0, 256.0)   = 64.0;
-uniform float foam_strength        : hint_range(0.0, 4.0)     = 1.2;
+// Raised 0.06 → 0.11: a near-mirror surface turns any sub-pixel normal wobble
+// into firefly specular sparkle. A little base roughness widens the BRDF lobe
+// and settles it without making the water look matte.
+uniform float water_roughness      : hint_range(0.0, 0.5)     = 0.11;
+// Softer + broader glint (1.8/64 → 1.2/26): a very tight highlight on noisy
+// normals is exactly what flickers as the camera/waves move.
+uniform float sun_glint_strength   : hint_range(0.0, 6.0)     = 1.2;
+uniform float sun_glint_sharpness  : hint_range(8.0, 256.0)   = 26.0;
+uniform float foam_strength        : hint_range(0.0, 4.0)     = 0.7;
 
 varying vec3 v_obj_pos;
 
@@ -100,15 +105,18 @@ float wave_field(vec3 p, float t, float close_amp) {
 	vec3 rip_p = (p + vec3(5.8 * t, -4.2 * t, 6.1 * t)) * wave_scale_ripple;
 	float ripple = vnoise(rip_p);
 
-	float sum = swell * 0.58 + chop * 0.28 + ripple * 0.14;
+	// Weighted toward the long swell; the high-freq ripple is dialled back
+	// (0.14 → 0.08) so it textures the surface without dominating the normal
+	// with fine chatter (the source of the sparkle).
+	float sum = swell * 0.64 + chop * 0.28 + ripple * 0.08;
 
 	// LOD detail — only contributes when close (close_amp > 0). Even higher
-	// frequency, fastest motion. This is what gives nearby water the
-	// glittery surface you can see individual wavelets on.
+	// frequency, fastest motion. Amplitude halved (0.22 → 0.10) so nearby water
+	// reads as fine wavelets, not sandpaper.
 	if (close_amp > 0.001) {
 		vec3 close_p = (p + vec3(8.0 * t, -7.0 * t, 9.5 * t)) * wave_scale_close;
 		float close_detail = vnoise(close_p);
-		sum = mix(sum, sum + close_detail * 0.22, close_amp);
+		sum = mix(sum, sum + close_detail * 0.10, close_amp);
 	}
 	return sum;
 }
@@ -165,9 +173,11 @@ void fragment() {
 	float fresnel  = pow(1.0 - n_dot_v, fresnel_power);
 
 	// Wave STEEPNESS (gradient magnitude) — whitecaps form where the surface
-	// is sharply tilted, which is what makes wind-driven foam.
-	float steep = length(vec2(dx, dz)) * 60.0;
-	float foam_t = clamp(smoothstep(0.42, 0.95, steep) * foam_strength, 0.0, 1.0);
+	// is sharply tilted. Lower gain (60 → 32) + a higher, wider threshold so
+	// foam only appears on genuinely steep crests instead of speckling the
+	// whole surface wherever the noise gradient twitches.
+	float steep = length(vec2(dx, dz)) * 32.0;
+	float foam_t = clamp(smoothstep(0.60, 1.40, steep) * foam_strength, 0.0, 1.0);
 
 	// Base water colour: deep blue everywhere — does NOT depend on the wave
 	// height noise, which is what made the old surface look spotted. View-
@@ -193,9 +203,15 @@ void fragment() {
 	float day_factor  = smoothstep(-0.05, 0.25, dot(radial_world, to_sun));
 	vec3 sun_glint    = sun_color * glint * sun_glint_strength * day_factor;
 
+	// Distance roughening: past a few hundred metres the wave normal detail is
+	// sub-pixel, so a near-mirror surface there aliases into a sparkle field.
+	// Fading roughness UP with distance turns that sub-pixel detail into a soft
+	// sheen (the physically-correct LOD for specular) while the near surface
+	// stays crisp. Foam still overrides to fully rough on crests.
+	float dist_rough = smoothstep(lod_near, lod_far, view_dist) * 0.22;
 	ALBEDO    = col;
 	EMISSION  = sun_glint;
-	ROUGHNESS = mix(water_roughness, water_roughness + 0.45, foam_t);
+	ROUGHNESS = clamp(mix(water_roughness + dist_rough, water_roughness + 0.45, foam_t), 0.0, 1.0);
 	SPECULAR  = 0.55;
 	METALLIC  = 0.0;
 	NORMAL    = (VIEW_MATRIX * vec4(nrm_world, 0.0)).xyz;

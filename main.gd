@@ -14,6 +14,9 @@ var fps_label : Label
 var time_label: Label
 
 var _wireframe : bool = false
+# Which body the player is parented to / focused on. false = Earth-like planet
+# (the spawn default), true = moon. Toggled with [M].
+var _focus_moon : bool = false
 
 
 func _ready() -> void:
@@ -77,7 +80,7 @@ func _build_hud() -> void:
 	vbox.add_child(time_label)
 
 	var help := _make_label("")
-	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [C] clouds  [`] wireframe  [Esc] release mouse"
+	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [M] planet/moon  [C] clouds  [`] wireframe  [Esc] release mouse"
 	help.modulate = Color(1, 1, 1, 0.75)
 	vbox.add_child(help)
 
@@ -114,10 +117,36 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo \
 			and (event as InputEventKey).keycode == KEY_C:
 		world.toggle_clouds()
+	# [M] toggles focus between the planet and the moon: reparents the player to
+	# the chosen body so it travels with that body's orbit, drops it above the
+	# surface and aims at the body, and repoints gravity/altitude queries there.
+	if event is InputEventKey and event.pressed and not event.echo \
+			and (event as InputEventKey).keycode == KEY_M:
+		_set_focus_to_moon(not _focus_moon)
+
+
+# Reparent + reposition the player onto the planet (false) or the moon (true).
+func _set_focus_to_moon(to_moon: bool) -> void:
+	_focus_moon = to_moon
+	var target_system : Node3D = world.moon_system if to_moon else world.planet_system
+	var target_planet : Planet = world.moon if to_moon else world.planet
+	# Clear the tallest terrain on whichever body we're dropping onto.
+	var surf_max : float = target_planet.density.max_surface_radius()
+	# reparent() so the player rides the chosen body's orbit. _ready runs only on
+	# first tree entry, so the camera rig isn't rebuilt; pass keep_global=false
+	# since we set a fresh local position right after.
+	player.reparent(target_system, false)
+	# Drop in over the sunlit hemisphere (toward -X, back toward the star), clear
+	# of terrain — same convention as the initial spawn in _ready().
+	player.position = Vector3(-(surf_max + 500.0), 0.0, 0.0)
+	player.look_at(target_system.global_position, Vector3.UP)
+	player.set_planet(target_planet)
+	player.velocity = Vector3.ZERO
 
 
 func _on_planet_stats(active: int, pending: int, tris: int, lod_violations: int) -> void:
-	var alt := world.planet.altitude_above_surface(player.global_position)
+	var focused_planet : Planet = world.moon if _focus_moon else world.planet
+	var alt := focused_planet.altitude_above_surface(player.global_position)
 	hud_label.text = "Chunks %d (+%d pending)   Tris %s   2:1 violations %d   Altitude %.0f m   Mode %s" % [
 		active, pending, _comma(tris), lod_violations, alt,
 		"FLIGHT" if player.mode == FlightPlayer.Mode.FLIGHT else "WALK"

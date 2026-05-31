@@ -97,11 +97,13 @@ func sample(p: Vector3) -> float:
 	#   depth*falloff(x) is subtracted (dig the bowl)
 	#   rim*rim_profile(x) is added  (raise the rim around the edge)
 	# where x = angular distance / crater_angular_radius (∈ [0, ~1.5]).
+	# `_craters` holds exactly `crater_count` craters × 6 floats (see _seed_craters),
+	# so the count is already known — no need to re-derive it by integer-dividing
+	# the flat array length on every sample (this runs millions of times while
+	# meshing). Using crater_count directly also drops the integer-division warning.
 	var stride := 6
 	var i := 0
-	@warning_ignore("integer_division")
-	var count : int = _craters.size() / stride
-	for _ci in count:
+	for _ci in crater_count:
 		var cx : float = _craters[i + 0]
 		var cy : float = _craters[i + 1]
 		var cz : float = _craters[i + 2]

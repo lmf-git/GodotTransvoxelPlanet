@@ -35,6 +35,18 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, l
 @export var stale_tolerance : int = 90           # frames a chunk can be unvisited before free — wider window so the atomic-swap gate (parent meshed + fine neighbours re-meshed for new transition mask) ALWAYS completes before the old chunk is freed; was 30 (~0.5 s), too short under load
 @export var terrain_material : Material
 
+# View-cone culling. The far hemisphere is already dropped by _node_beyond_horizon
+# and Godot frustum-culls off-screen DRAWING for free — but chunks behind/beside
+# the camera are still GENERATED, meshed and walked every octree pass (CPU + RAM,
+# not GPU). This skips generating nodes outside the camera's view cone so only the
+# direction you're looking at is streamed. A near bubble around the camera is
+# always kept (collision + instant turn-around), and the cone is widened by a
+# margin so the boundary stays off-screen; fast spins may still pop. Toggle off if
+# it ever culls something it shouldn't.
+@export var view_cull_enabled    : bool  = true
+@export var view_cull_margin_deg : float = 14.0   # extra half-angle past the frustum corner so the cull edge sits off-screen
+@export var view_cull_keep_factor: float = 3.0    # near-bubble radius = this × the coarsest collision-chunk size
+
 # Shared scatter resources — created once, referenced by every chunk's
 # MultiMeshInstance3D. Saves N MeshInstances and N materials across N chunks.
 var _scatter_mesh     : Mesh
@@ -51,7 +63,7 @@ var density : Variant
 # mesher all operate in the planet's local frame.
 var planet_center : Vector3 = Vector3.ZERO
 
-var _chunks        : Dictionary = {}   # key (String) → ChunkRecord
+var _chunks        : Dictionary = {}   # key (packed int, see _key) → ChunkRecord
 var _pending_load  : Array      = []   # keys queued for their FIRST mesh
 var _pending_remesh: Array      = []   # keys queued to re-mesh after a neighbour-LOD mask change
 var _generation   : int        = 0
@@ -62,6 +74,13 @@ var _total_tris   : int        = 0
 # stationary. `_retraverse_threshold` is set in _ready to ~half a finest voxel.
 var _last_cam_local      : Vector3 = Vector3(1e20, 1e20, 1e20)
 var _retraverse_threshold: float   = 2.0
+# View-cone cull state, recomputed each traversal (all in the planet's LOCAL
+# frame, to match the octree). Rotation also triggers a retraverse — without it,
+# spinning in place (no position change) would never re-stream the new view.
+var _cam_forward_local      : Vector3 = Vector3(0, 0, 1)
+var _last_cam_forward_local : Vector3 = Vector3(0, 0, 1)
+var _cull_half_angle        : float   = 1.2   # frustum-corner half-angle (rad)
+var _cull_keep_radius       : float   = 0.0   # near bubble always kept
 # The 2:1-violation HUD stat is O(chunks·faces·depth); compute it occasionally,
 # not every frame.
 var _violation_frame     : int     = 0
@@ -83,11 +102,17 @@ class ChunkRecord:
 
 
 func _ready() -> void:
+	# Create the native mesher first: the default DensityField delegates its
+	# sampling to it (single source of truth with the mesh — see density.gd).
+	if ClassDB.class_exists("NativeTerrain"):
+		_native = ClassDB.instantiate("NativeTerrain")
+	else:
+		push_error("NativeTerrain GDExtension not loaded — no terrain will mesh.")
 	# Default density is the Earth-like field. world.gd injects a different
 	# one (e.g. CraterDensity for the moon) via `set_density()` BEFORE
 	# add_child(planet) — in that case we skip the auto-init.
 	if density == null:
-		density = DensityField.new(planet_radius, world_seed)
+		density = DensityField.new(planet_radius, world_seed, _native)
 	planet_center = Vector3.ZERO   # planet's own local origin
 	if terrain_material == null:
 		var m := StandardMaterial3D.new()
@@ -95,10 +120,6 @@ func _ready() -> void:
 		terrain_material = m
 	_scatter_mesh     = TerrainScatter.make_rock_mesh()
 	_scatter_material = TerrainScatter.make_rock_material()
-	if ClassDB.class_exists("NativeTerrain"):
-		_native = ClassDB.instantiate("NativeTerrain")
-	else:
-		push_error("NativeTerrain GDExtension not loaded — no terrain will mesh.")
 	_retraverse_threshold = base_chunk_size / float(voxel_resolution) * 0.5
 	_camera = _find_camera()
 
@@ -130,12 +151,25 @@ func _process(_dt: float) -> void:
 	# the octree (which works in the planet's local space) compares apples
 	# to apples even when the parent PlanetSystem has orbited or rotated.
 	var cam_local := to_local(_camera.global_position)
-	# Only re-decide the LOD octree (the costly traverse + inline 26-neighbour
-	# balance walk) when the camera has actually moved. While hovering, the
-	# octree is identical frame-to-frame, so we just keep the existing chunks
-	# alive and skip the heavy work — that's the main framerate win.
-	if cam_local.distance_to(_last_cam_local) > _retraverse_threshold:
+	_update_view_cone()
+	# Re-decide the LOD octree (the costly traverse + inline balance walk) when
+	# the camera has moved OR the octree hasn't settled yet. "Unsettled" = work
+	# still queued: the materialised-state balance net (_face_neighbor_has_finer_chunk)
+	# resolves a 2:1 cascade one ring per traversal and feeds the new chunks into
+	# _pending_load, so as long as a queue is non-empty we must keep traversing to
+	# let the cascade finish — otherwise it would freeze the moment the camera
+	# stops, stranding a ring of violations. Once everything is balanced and meshed
+	# the queues drain, this falls back to the camera-moved gate, and hovering
+	# costs nothing again (the framerate win).
+	var camera_moved := cam_local.distance_to(_last_cam_local) > _retraverse_threshold
+	# Pure rotation moves no chunks but changes which side of the planet is in the
+	# view cone, so it must also re-stream. ~2° hysteresis avoids per-frame churn.
+	var camera_rotated := view_cull_enabled \
+			and _cam_forward_local.dot(_last_cam_forward_local) < 0.99939
+	var octree_unsettled := not _pending_load.is_empty() or not _pending_remesh.is_empty()
+	if camera_moved or camera_rotated or octree_unsettled:
 		_last_cam_local = cam_local
+		_last_cam_forward_local = _cam_forward_local
 		_traverse_root(cam_local)
 		_collect_stale_chunks()
 		# Balance is enforced INLINE during traversal; no post-pass (it punched
@@ -185,13 +219,14 @@ func set_scatter_axis(polar_axis_object: Vector3) -> void:
 
 
 # Collect finished meshes from the native thread pool and route each back to
-# its chunk by instance id. take_result is always called (even for freed
-# chunks) so the native result map can't leak.
+# its chunk by instance id. take_all_ready drains the WHOLE map every frame
+# (even results for freed chunks — instance_from_id returns null for those and
+# we just skip them), so the native result map can't leak.
 func _poll_native() -> void:
 	if _native == null:
 		return
-	# One batched drain (single lock + single FFI hop) instead of poll_ready_ids
-	# followed by one take_result per chunk. Each entry carries its own "id".
+	# One batched drain: a single lock + single FFI hop for all finished chunks,
+	# each entry carrying its own "id".
 	var batch : Array = _native.call("take_all_ready")
 	for res in batch:
 		var obj := instance_from_id(int(res["id"]))
@@ -212,13 +247,18 @@ func _traverse_root(cam_pos: Vector3) -> void:
 				var root_center := origin + Vector3(root_size, root_size, root_size) * 0.5
 				if _node_beyond_horizon(root_center, root_size, cam_pos):
 					continue
+				if _node_outside_view_cone(origin, root_size, root_center, cam_pos):
+					continue
 				_visit_node(max_lod, Vector3i(ix, iy, iz), origin, root_size, cam_pos)
 
 
 func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_pos: Vector3) -> void:
 	var center := origin + Vector3(size, size, size) * 0.5
-	# Drop the whole subtree if it's behind the planet's horizon.
+	# Drop the whole subtree if it's behind the planet's horizon or outside the
+	# camera's view cone.
 	if _node_beyond_horizon(center, size, cam_pos):
+		return
+	if _node_outside_view_cone(origin, size, center, cam_pos):
 		return
 	var dist := cam_pos.distance_to(center)
 	var subdivide := lod > 0 and dist < size * lod_factor
@@ -233,7 +273,19 @@ func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_p
 	# each child we create at lod-1 runs the same check, so balance
 	# propagates all the way down to LOD 0 as needed.
 	if not subdivide and lod >= 2:
-		if _balance_requires_subdivide(lod, center, size, cam_pos):
+		# Two complementary balance tests, OR'd:
+		#  1. Position estimate — predicts a finer neighbour from camera distance.
+		#     Cheap and forward-looking, but OPEN-LOOP: it can't see a neighbour
+		#     that is finer only because BALANCE forced it (a transitive cascade),
+		#     so on its own it leaves a persistent ring of 2:1 violations.
+		#  2. Materialised-state test — looks at the chunks that ACTUALLY exist and
+		#     splits us if a real chunk two LODs finer already borders our face,
+		#     regardless of why it's finer. This closes the loop: the cascade
+		#     propagates one ring per frame and settles, driving the violation
+		#     count to zero. Monotone (only ever adds subdivisions), so the
+		#     atomic-swap free gate still prevents holes.
+		if _balance_requires_subdivide(lod, center, size, cam_pos) \
+				or _face_neighbor_has_finer_chunk(lod, coords):
 			subdivide = true
 
 	if subdivide:
@@ -299,6 +351,66 @@ func _balance_requires_subdivide(
 	return false
 
 
+# Materialised-state balance net. Returns true if a real chunk TWO LODs finer
+# already exists face-adjacent to the cell at (lod, coords) — a live 2:1
+# violation that the distance-based predicate missed (because the neighbour was
+# itself balance-forced finer, not distance-forced). Splitting us to lod-1 makes
+# the boundary a single step again; the freed coarse parent is held by the
+# atomic-swap gate until our children mesh, so no hole opens.
+#
+# We check the lod-2 cells that tile each of our 6 faces (a 4×4 grid per face).
+# Only faces are tested — that's exactly what the HUD violation stat counts, and
+# edge/corner cases are already covered by the 26-neighbour position predicate.
+func _face_neighbor_has_finer_chunk(lod: int, coords: Vector3i) -> bool:
+	if lod < 2:
+		return false
+	# Any adjacent leaf at lod <= lod-2 is a 2:1 violation. We sample the centre of
+	# each lod-2 cell tiling our 6 faces and ask what leaf ACTUALLY covers it (at
+	# any depth). Because subdivision is all-or-nothing, a lod-2 cell that is split
+	# has its centre inside a finer leaf, so centre-sampling detects violations of
+	# arbitrary depth — not just exactly lod-2 (the bug that left ~30 deep jumps).
+	var threshold := lod - 2
+	var size_lod2 : float = base_chunk_size * pow(2.0, float(threshold))
+	var faces := [
+		Vector3i(-1, 0, 0), Vector3i(1, 0, 0),
+		Vector3i(0, -1, 0), Vector3i(0, 1, 0),
+		Vector3i(0, 0, -1), Vector3i(0, 0, 1),
+	]
+	for dir : Vector3i in faces:
+		# Neighbour cell at our LOD, expressed in lod-2 cell coords (4× finer).
+		var ncoords := coords + dir
+		var base := ncoords * 4
+		var axis := 0 if dir.x != 0 else (1 if dir.y != 0 else 2)
+		# The lod-2 layer of the neighbour that actually touches our shared face:
+		# its low side when the neighbour is on our +axis, its high side on -axis.
+		var near : int = 0 if dir[axis] > 0 else 3
+		var u := (axis + 1) % 3
+		var v := (axis + 2) % 3
+		for du in 4:
+			for dv in 4:
+				var c := base
+				c[axis] = base[axis] + near
+				c[u] = base[u] + du
+				c[v] = base[v] + dv
+				var center := (Vector3(c) + Vector3.ONE * 0.5) * size_lod2
+				if _has_leaf_at_or_below(center, threshold):
+					return true
+	return false
+
+
+# True if an existing leaf chunk covers world point `p` at some lod <= max_lod_inc.
+# `_chunks` holds leaves only, so we probe finest-first and stop at the first hit
+# (that's the unique leaf containing `p`); coarser-than-threshold leaves return
+# false. Bounded to threshold+1 lookups.
+func _has_leaf_at_or_below(p: Vector3, max_lod_inc: int) -> bool:
+	for l in range(0, max_lod_inc + 1):
+		var sz : float = base_chunk_size * pow(2.0, float(l))
+		var cc := Vector3i(floori(p.x / sz), floori(p.y / sz), floori(p.z / sz))
+		if _chunks.has(_key(l, cc)):
+			return true
+	return false
+
+
 # Returns the LOD at which the OCTREE CELL containing position `p` would
 # be a leaf. Walks the standard subdivision criterion from the root down,
 # computing each enclosing cell's centre and asking whether it subdivides.
@@ -354,17 +466,16 @@ func _ensure_chunk(lod: int, coords: Vector3i, origin: Vector3, size: float) -> 
 	# Native mesher + the seed it rebuilds the density from.
 	rec.chunk.native = _native
 	rec.chunk.world_seed = world_seed
-	# Capture rec via the closure so we can count triangles when ready.
+	# Capture rec via the closure so we can keep the running triangle total. The
+	# chunk already knows its own tri_count at apply time, so we just read it
+	# (no expensive surface_get_arrays() mesh readback). Subtract the previous
+	# count before adding the new one so a re-mesh (mask change) doesn't drift
+	# the total upward.
 	rec.chunk.mesh_ready.connect(func(c: VoxelChunk) -> void:
 		rec.has_mesh = true
-		var mi := _mesh_instance_of(c)
-		if mi and mi.mesh:
-			var arr := (mi.mesh as ArrayMesh).surface_get_arrays(0)
-			if arr.size() > Mesh.ARRAY_INDEX and arr[Mesh.ARRAY_INDEX] != null:
-				@warning_ignore("integer_division")
-				var tc : int = (arr[Mesh.ARRAY_INDEX] as PackedInt32Array).size() / 3
-				rec.tri_count = tc
-				_total_tris += tc)
+		_total_tris -= rec.tri_count
+		rec.tri_count = c.tri_count
+		_total_tris += rec.tri_count)
 	_pending_load.append(key)
 	_chunks[key] = rec
 	return rec
@@ -583,7 +694,7 @@ func _drain_pending_load() -> void:
 	# the worker pool; getting the seam-fixers in first is what matters.
 	var remeshed := 0
 	while remeshed < max_remesh_per_tick and not _pending_remesh.is_empty():
-		var rkey : String = _pending_remesh.pop_front()
+		var rkey : int = _pending_remesh.pop_front()
 		if not _chunks.has(rkey):
 			continue
 		var rrec : ChunkRecord = _chunks[rkey]
@@ -594,7 +705,7 @@ func _drain_pending_load() -> void:
 	# Then initial meshes for newly-revealed chunks.
 	var dispatched := 0
 	while dispatched < max_new_chunks_per_tick and not _pending_load.is_empty():
-		var key : String = _pending_load.pop_front()
+		var key : int = _pending_load.pop_front()
 		if not _chunks.has(key):
 			continue
 		var rec : ChunkRecord = _chunks[key]
@@ -604,15 +715,69 @@ func _drain_pending_load() -> void:
 		dispatched += 1
 
 
-func _key(lod: int, coords: Vector3i) -> String:
-	return "%d_%d_%d_%d" % [lod, coords.x, coords.y, coords.z]
+# Pack (lod, coords) into a single 64-bit int key for the _chunks dictionary.
+# Int keys hash far faster than the old "%d_%d_%d_%d" strings — and the hot path
+# (traversal + the balance net's _has_leaf_at_or_below) does a great many lookups
+# per frame. Layout: lod in bits 48-51, then x/y/z in 16-bit signed fields. 16
+# bits gives a ±32768 coord range per axis — at LOD 0 the finest coords reach
+# ±base_chunk_size·2^max_lod / base_chunk_size = ±2^max_lod, so this holds for
+# max_lod up to 15 (we run 9). Nothing ever decodes the key, so the packing only
+# needs to be collision-free, which it is within that range.
+func _key(lod: int, coords: Vector3i) -> int:
+	return (lod << 48) \
+		| ((coords.x & 0xFFFF) << 32) \
+		| ((coords.y & 0xFFFF) << 16) \
+		| (coords.z & 0xFFFF)
 
 
-func _mesh_instance_of(c: VoxelChunk) -> MeshInstance3D:
-	for child in c.get_children():
-		if child is MeshInstance3D:
-			return child
-	return null
+# Recompute the camera view cone (local frame) + the near-keep bubble. Cheap;
+# called once per frame before traversal.
+func _update_view_cone() -> void:
+	if _camera == null:
+		return
+	# Godot cameras look down -Z. Bring forward into the planet's LOCAL frame so
+	# it compares directly against node centres (which are local).
+	var fwd_world := -_camera.global_transform.basis.z
+	_cam_forward_local = (global_transform.basis.inverse() * fwd_world).normalized()
+	# Half-angle to the frustum CORNER, from vertical FOV + viewport aspect, so the
+	# cone fully encloses the rectangular frustum and never culls an on-screen node.
+	var tan_v := tan(deg_to_rad(_camera.fov) * 0.5)
+	var aspect := 1.7777778
+	var vp := get_viewport()
+	if vp != null:
+		var vs := vp.get_visible_rect().size
+		if vs.y > 0.0:
+			aspect = vs.x / vs.y
+	var tan_h := tan_v * aspect
+	_cull_half_angle = atan(sqrt(tan_v * tan_v + tan_h * tan_h))
+	_cull_keep_radius = base_chunk_size * pow(2.0, float(collision_lod_max + 1)) * view_cull_keep_factor
+
+
+# View-cone culling. Skips generating a node whose bounding sphere lies entirely
+# outside the camera's (margin-widened) view cone — UNLESS it overlaps the near
+# bubble, which is always kept so collision under the player and instant
+# turn-around survive. Complements the horizon cull (which drops the far side);
+# together they keep only the chunks you can actually look at.
+func _node_outside_view_cone(origin: Vector3, size: float, center: Vector3, cam_pos: Vector3) -> bool:
+	if not view_cull_enabled:
+		return false
+	# Nearest point of the node cube to the camera — keeps any node overlapping
+	# the bubble, including huge coarse roots whose centre is far away.
+	var nearest := Vector3(
+		clampf(cam_pos.x, origin.x, origin.x + size),
+		clampf(cam_pos.y, origin.y, origin.y + size),
+		clampf(cam_pos.z, origin.z, origin.z + size))
+	if cam_pos.distance_to(nearest) <= _cull_keep_radius:
+		return false
+	var to_node := center - cam_pos
+	var dist := to_node.length()
+	if dist < 1e-3:
+		return false
+	var dir := to_node / dist
+	var node_bound := size * 0.8660254   # half the cube's space-diagonal
+	var node_ang := asin(clampf(node_bound / dist, -1.0, 1.0))
+	var ang := acos(clampf(_cam_forward_local.dot(dir), -1.0, 1.0))
+	return ang > _cull_half_angle + node_ang + deg_to_rad(view_cull_margin_deg)
 
 
 # Far-side (horizon) culling. A node is skipped only when its entire bounding
