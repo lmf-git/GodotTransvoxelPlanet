@@ -3,11 +3,12 @@ extends Node3D
 
 ## A single voxel chunk: density grid → marching-cubes mesh + (optional) collision.
 ##
-## Threading model — important: the worker thread does NOT reference `self`.
-## It only writes to a shared `_MeshResultHolder` (a RefCounted) that the chunk
-## polls on _process. This means the chunk can be freed at any time without
-## crashing the worker — the holder lives as long as the worker's closure
-## holds it, and dies cleanly once the closure returns.
+## Threading model — important: all meshing happens in the Rust thread pool
+## (NativeTerrain). This node never spawns a thread. request_build() submits the
+## job by instance id; the Rust worker writes the finished mesh into the native
+## result map (it never references this node), and Planet._poll_native drains the
+## batch each frame and calls apply_native_result() here, on the main thread. So
+## the chunk can be freed at any time without affecting an in-flight job.
 
 signal mesh_ready(chunk: VoxelChunk)
 
@@ -43,31 +44,9 @@ var _mesh_instance : MeshInstance3D
 var _static_body   : StaticBody3D
 var _coll_shape    : CollisionShape3D
 var _scatter_mmi   : MultiMeshInstance3D
-var _task_id       : int = -1
 var _pending       : bool = false   # a native mesh job is in flight
 var _alive         : bool = true
 var _has_mesh      : bool = false
-var _holder        : _MeshResultHolder
-
-
-class _MeshResultHolder:
-	extends RefCounted
-	var result : Dictionary = {}
-	var ready  : bool       = false
-	var mutex  : Mutex      = Mutex.new()
-
-	func set_result(r: Dictionary) -> void:
-		mutex.lock()
-		result = r
-		ready = true
-		mutex.unlock()
-
-	func consume() -> Dictionary:
-		mutex.lock()
-		var r := result
-		result = {}
-		mutex.unlock()
-		return r
 
 
 func setup(
@@ -89,6 +68,11 @@ func setup(
 	build_collision = p_build_collision
 	position = Vector3.ZERO
 	name = "Chunk_L%d_%d_%d_%d" % [lod, int(origin.x), int(origin.y), int(origin.z)]
+	# Meshing is owned by the Rust thread pool; results are pushed in via
+	# apply_native_result() (called from Planet._poll_native). The chunk itself
+	# has no per-frame work, so don't pay for an empty _process callback on every
+	# one of the thousands of live chunks.
+	set_process(false)
 
 
 func request_build() -> void:
@@ -139,20 +123,6 @@ func needs_remesh_for_mask() -> bool:
 # (not merely submitted — `_last_built_mask` updates at submit time).
 func is_dirty() -> bool:
 	return _pending or transition_mask != _last_built_mask
-
-
-func _process(_dt: float) -> void:
-	if _holder == null or not _holder.ready:
-		return
-	var result := _holder.consume()
-	_holder = null
-	_task_id = -1
-	if not _alive:
-		queue_free()
-		return
-	_apply_mesh(result)
-	_has_mesh = true
-	mesh_ready.emit(self)
 
 
 func _apply_mesh(result: Dictionary) -> void:
@@ -276,12 +246,9 @@ func has_mesh() -> bool:
 
 
 func release() -> void:
+	# Safe to free immediately: the Rust worker never references this node (it
+	# only writes into the native result map, keyed by instance id). If a job is
+	# still in flight, Planet._poll_native still drains and discards the result —
+	# instance_from_id() returns null once we're freed — so nothing leaks.
 	_alive = false
-	# Free immediately if no task is in flight. Otherwise _process will free us
-	# once the worker writes its result (or never — see below).
-	if _holder == null:
-		queue_free()
-	# If a task is in flight, we *can* still queue_free now because the worker
-	# no longer references self — only the holder. The holder will be GC'd
-	# when the closure returns. Safe either way.
 	queue_free()

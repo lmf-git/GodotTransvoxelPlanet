@@ -31,11 +31,14 @@ uniform vec3  sun_direction        = vec3(0.6, 0.5, 0.4);
 uniform vec3  sun_color            : source_color = vec3(1.0, 0.96, 0.86);
 uniform vec3  polar_axis           = vec3(0.0, 1.0, 0.0);   // stable tangent reference
 
-uniform float wave_scale_swell     : hint_range(0.0001, 0.02) = 0.0018;
-uniform float wave_scale_chop      : hint_range(0.001, 0.05)  = 0.011;
-uniform float wave_scale_ripple    : hint_range(0.005, 0.5)   = 0.06;
-uniform float wave_strength        : hint_range(0.0, 1.5)     = 0.42;
-uniform float wave_speed           : hint_range(0.0, 0.5)     = 0.06;
+uniform float wave_scale_swell     : hint_range(0.0001, 0.02) = 0.0022;
+uniform float wave_scale_chop      : hint_range(0.001, 0.05)  = 0.014;
+uniform float wave_scale_ripple    : hint_range(0.005, 0.5)   = 0.075;
+uniform float wave_scale_close     : hint_range(0.05, 2.0)    = 0.45;   // fine ripple octave that LOD-fades in when the camera is near the surface
+uniform float wave_strength        : hint_range(0.0, 2.0)     = 0.55;
+uniform float wave_speed           : hint_range(0.0, 1.5)     = 0.45;   // bumped: 0.06 was a fraction of a feature/sec — surface looked frozen
+uniform float lod_near             : hint_range(1.0, 500.0)   = 30.0;   // metres: ramp-in is fully on at this distance
+uniform float lod_far              : hint_range(100.0, 8000.0)= 1800.0; // metres: detail ramp-in is off beyond this
 
 uniform float fresnel_power        : hint_range(1.0, 8.0)     = 4.0;
 uniform float water_roughness      : hint_range(0.0, 0.5)     = 0.06;
@@ -70,16 +73,44 @@ float vnoise(vec3 p) {
 		f.z);
 }
 
-// Three-octave wave field. Each octave drifts at a different speed and
-// direction so the surface reads as moving water, not a scrolling texture.
-// Swell is the dominant long-period rise/fall; chop adds wind-driven mid-
-// frequency; ripple is the high-freq surface roughness that gives sun glints
-// their characteristic glitter.
-float wave_field(vec3 p, float t) {
-	float swell  = vnoise(p * wave_scale_swell  + vec3(t * 0.30, 0.0, t * 0.18));
-	float chop   = vnoise(p * wave_scale_chop   + vec3(-t * 0.65, t * 0.40, t * 0.55));
-	float ripple = vnoise(p * wave_scale_ripple + vec3(t * 1.20, t * 0.90, -t * 1.05));
-	return swell * 0.62 + chop * 0.28 + ripple * 0.10;
+// Directional wave field. Each octave samples noise at an ANISOTROPICALLY
+// stretched position (stretched along its propagation direction), which
+// turns blobby value noise into long parallel crests that LOOK like rolling
+// swells instead of spotted patches. Drift speeds are also much larger in
+// noise space than before so the waves visibly travel each frame.
+//
+// `close_amp` scales an extra high-frequency octave that's only sampled
+// when the camera is near the surface — that's the LOD: from orbit you get
+// the cheap 3-octave swell+chop+ripple; standing on a cliff above the sea
+// you also get the fine wind-ripple detail that catches the sun glints.
+float wave_field(vec3 p, float t, float close_amp) {
+	// Swell — long, slow, anisotropic. Stretch the sample position along
+	// (1, 0, 0.3) so the noise features elongate into rolling lines roughly
+	// transverse to the propagation direction.
+	vec3 swell_p = (p + vec3(2.0 * t, 0.0, 0.6 * t)) * wave_scale_swell;
+	swell_p.x *= 0.42;   // stretch along propagation → wider crests, parallel lines
+	float swell = vnoise(swell_p);
+
+	// Chop — mid-freq, faster, different direction.
+	vec3 chop_p = (p + vec3(-3.5 * t, 2.1 * t, 1.4 * t)) * wave_scale_chop;
+	chop_p.z *= 0.55;
+	float chop = vnoise(chop_p);
+
+	// Ripple — high-freq, fastest. No anisotropy (looks more like wind chatter).
+	vec3 rip_p = (p + vec3(5.8 * t, -4.2 * t, 6.1 * t)) * wave_scale_ripple;
+	float ripple = vnoise(rip_p);
+
+	float sum = swell * 0.58 + chop * 0.28 + ripple * 0.14;
+
+	// LOD detail — only contributes when close (close_amp > 0). Even higher
+	// frequency, fastest motion. This is what gives nearby water the
+	// glittery surface you can see individual wavelets on.
+	if (close_amp > 0.001) {
+		vec3 close_p = (p + vec3(8.0 * t, -7.0 * t, 9.5 * t)) * wave_scale_close;
+		float close_detail = vnoise(close_p);
+		sum = mix(sum, sum + close_detail * 0.22, close_amp);
+	}
+	return sum;
 }
 
 
@@ -104,20 +135,30 @@ void fragment() {
 	vec3 t_x = normalize(cross(up_obj, ref));
 	vec3 t_z = normalize(cross(up_obj, t_x));
 
-	float w0 = wave_field(op, t);
+	// View-distance LOD: ramp the close-detail octave in between lod_near and
+	// lod_far. Computed BEFORE the wave_field samples so all three samples
+	// (centre + two finite-difference taps) use the same octave set and the
+	// gradient is consistent.
+	vec3 wp_centre = (MODEL_MATRIX * vec4(op, 1.0)).xyz;
+	float view_dist = length(CAMERA_POSITION_WORLD - wp_centre);
+	float close_amp = smoothstep(lod_far, lod_near, view_dist);
+
+	float w0 = wave_field(op, t, close_amp);
 	// Finite-difference along the tangent vectors (sphere surface), not along
 	// world axes — gives correct gradients regardless of where on the sphere
-	// the fragment is.
-	float h = 2.5;
-	float dx = wave_field(op + t_x * h, t) - w0;
-	float dz = wave_field(op + t_z * h, t) - w0;
+	// the fragment is. Sample step `h` shrinks when close so the close-detail
+	// octave's gradient is captured at the right scale (without this the
+	// fine ripple gets blurred out of the normal).
+	float h = mix(2.5, 0.6, close_amp);
+	float dx = wave_field(op + t_x * h, t, close_amp) - w0;
+	float dz = wave_field(op + t_z * h, t, close_amp) - w0;
 
 	// Perturb the outward normal by the wave gradient.
 	vec3 nrm_obj = normalize(up_obj + (t_x * dx + t_z * dz) * wave_strength);
 
-	// World-space versions for lighting.
+	// World-space versions for lighting. wp_centre already done above.
 	vec3 nrm_world = normalize((MODEL_MATRIX * vec4(nrm_obj, 0.0)).xyz);
-	vec3 wp        = (MODEL_MATRIX * vec4(op, 1.0)).xyz;
+	vec3 wp        = wp_centre;
 	vec3 view      = normalize(CAMERA_POSITION_WORLD - wp);
 	float n_dot_v  = clamp(dot(nrm_world, view), 0.0, 1.0);
 	// Schlick-style Fresnel — surface gets MORE reflective at grazing angles.

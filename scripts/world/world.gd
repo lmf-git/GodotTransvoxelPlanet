@@ -342,7 +342,13 @@ func _build_planet_system() -> void:
 	# and with more spatial cushion.
 	planet.lod_factor = 2.2
 	planet.collision_lod_max = 1
-	planet.max_new_chunks_per_tick = 16
+	# Was 16 — but planet.gd's own default/comment flags 16/tick as too slow:
+	# with thousands of chunks pending it takes ~10 s to drain, far longer than
+	# the atomic-swap hold window, so the frontier falls behind the camera and
+	# cracks appear. The worker pool sits idle in the meantime (low CPU despite
+	# low FPS). Now that take_all_ready marshals results in bulk, a wider gate is
+	# affordable: keep the pool fed and the visible frontier ahead of the camera.
+	planet.max_new_chunks_per_tick = 64
 	planet.sea_level_offset = sea_level_offset
 	planet.name = "Planet"
 	terrain_mat = ShaderMaterial.new()

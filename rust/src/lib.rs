@@ -171,6 +171,43 @@ impl NativeTerrain {
         self.shared.input_cv.notify_one();
     }
 
+    /// Drain ALL finished meshes in a single call. Returns an Array of
+    /// Dictionaries, each = the `take_result` payload plus an `"id"` key. This
+    /// replaces the per-chunk poll_ready_ids → take_result(id) round-trip (two
+    /// FFI hops + two lock acquisitions per chunk, every frame) with one lock
+    /// and one FFI hop for the whole batch — meaningful when hundreds of chunks
+    /// stream in at once. `poll_ready_ids`/`take_result` are kept for callers
+    /// that still want the granular path.
+    #[func]
+    fn take_all_ready(&self) -> VarArray {
+        let drained: Vec<(i64, MeshData)> = {
+            let mut map = self.shared.output.lock().unwrap();
+            map.drain().collect()
+        };
+        let mut out = VarArray::new();
+        for (id, m) in drained {
+            let mut dict = VarDictionary::new();
+            dict.set("id", id);
+            let vcount = m.positions.len() / 3;
+            let mut pv: Vec<Vector3> = Vec::with_capacity(vcount);
+            let mut nv: Vec<Vector3> = Vec::with_capacity(vcount);
+            for i in 0..vcount {
+                pv.push(Vector3::new(
+                    m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2],
+                ));
+                nv.push(Vector3::new(
+                    m.normals[3 * i], m.normals[3 * i + 1], m.normals[3 * i + 2],
+                ));
+            }
+            dict.set("positions", PackedVector3Array::from(pv.as_slice()));
+            dict.set("normals", PackedVector3Array::from(nv.as_slice()));
+            dict.set("indices", PackedInt32Array::from(m.indices.as_slice()));
+            dict.set("empty", m.indices.is_empty());
+            out.push(&dict.to_variant());
+        }
+        out
+    }
+
     /// Instance ids of chunks whose mesh is ready. Call `take_result(id)` for
     /// each to retrieve and clear it.
     #[func]
@@ -194,27 +231,26 @@ impl NativeTerrain {
         let mut dict = VarDictionary::new();
         match mesh {
             Some(m) => {
+                // Marshal in bulk. `PackedArray::from(&[T])` is a single memcpy;
+                // the old per-element `arr[i] = …` did one bounds-checked FFI
+                // write per vertex — thousands of FFI hops per chunk on the main
+                // thread, which is what starved the framerate. We pack the flat
+                // f32 triples into Vec<Vector3> in pure Rust first (no FFI), then
+                // hand the whole slice over once.
                 let vcount = m.positions.len() / 3;
-                let mut positions = PackedVector3Array::new();
-                let mut normals = PackedVector3Array::new();
-                positions.resize(vcount);
-                normals.resize(vcount);
+                let mut pv: Vec<Vector3> = Vec::with_capacity(vcount);
+                let mut nv: Vec<Vector3> = Vec::with_capacity(vcount);
                 for i in 0..vcount {
-                    positions[i] = Vector3::new(
+                    pv.push(Vector3::new(
                         m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2],
-                    );
-                    normals[i] = Vector3::new(
+                    ));
+                    nv.push(Vector3::new(
                         m.normals[3 * i], m.normals[3 * i + 1], m.normals[3 * i + 2],
-                    );
+                    ));
                 }
-                let mut indices = PackedInt32Array::new();
-                indices.resize(m.indices.len());
-                for (k, &idx) in m.indices.iter().enumerate() {
-                    indices[k] = idx;
-                }
-                dict.set("positions", positions);
-                dict.set("normals", normals);
-                dict.set("indices", indices);
+                dict.set("positions", PackedVector3Array::from(pv.as_slice()));
+                dict.set("normals", PackedVector3Array::from(nv.as_slice()));
+                dict.set("indices", PackedInt32Array::from(m.indices.as_slice()));
                 dict.set("empty", m.indices.is_empty());
             }
             None => {

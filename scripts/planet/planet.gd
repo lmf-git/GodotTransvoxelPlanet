@@ -138,12 +138,20 @@ func _process(_dt: float) -> void:
 		_last_cam_local = cam_local
 		_traverse_root(cam_local)
 		_collect_stale_chunks()
+		# Balance is enforced INLINE during traversal; no post-pass (it punched
+		# holes by freeing coarse chunks before their finer replacements built).
+		#
+		# Neighbour masks only depend on which chunk RECORDS exist (see
+		# _compute_coarser_mask — it tests _chunks.has(), not has_mesh), and the
+		# chunk set only changes here (traverse creates, collect_stale frees).
+		# So when the camera hasn't moved past the threshold the masks are
+		# provably unchanged, and re-walking every chunk × 6 faces × depth each
+		# idle frame was pure wasted main-thread work — the "low FPS while the
+		# CPU is barely busy" smell. Run it only when the set actually changed.
+		_update_neighbor_masks()
 	else:
 		for rec in _chunks.values():
 			(rec as ChunkRecord).last_seen = _generation
-	# Balance is enforced INLINE during traversal; no post-pass (it punched
-	# holes by freeing coarse chunks before their finer replacements built).
-	_update_neighbor_masks()
 	_drain_pending_load()
 	_poll_native()
 	_update_scatter_material_uniforms()
@@ -182,10 +190,11 @@ func set_scatter_axis(polar_axis_object: Vector3) -> void:
 func _poll_native() -> void:
 	if _native == null:
 		return
-	var ids : PackedInt64Array = _native.call("poll_ready_ids")
-	for id in ids:
-		var res : Dictionary = _native.call("take_result", id)
-		var obj := instance_from_id(id)
+	# One batched drain (single lock + single FFI hop) instead of poll_ready_ids
+	# followed by one take_result per chunk. Each entry carries its own "id".
+	var batch : Array = _native.call("take_all_ready")
+	for res in batch:
+		var obj := instance_from_id(int(res["id"]))
 		if obj != null and obj is VoxelChunk:
 			(obj as VoxelChunk).apply_native_result(res)
 
