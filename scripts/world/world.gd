@@ -138,7 +138,10 @@ func _normalize_shell_radii() -> void:
 	# of its radius before becoming optically thin; pushing to 2400 m + clouds
 	# between 900–1900 m gives the horizon a proper soft fall-off and keeps
 	# clouds visibly suspended above terrain (max terrain peaks ≈ +1576 m).
-	atmosphere_radius  = planet_radius + 2400.0
+	# Atmosphere must ENCLOSE the cloud deck (top below) — otherwise the part of
+	# the deck poking above the shell has no haze over it and shows a hard line
+	# where the atmosphere stops. Cloud top is +2800, so +3000 covers it.
+	atmosphere_radius  = planet_radius + 3000.0
 	# Fatter cloud deck (was 900–1900 = 1 km thick). A thin deck has almost no
 	# vertical room, so when you fly INTO it the clouds vanish just above/below
 	# you. 600–2800 (2.2 km) gives a real volume to fly through; the depth-clipped

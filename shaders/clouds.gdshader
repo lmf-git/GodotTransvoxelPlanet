@@ -197,7 +197,7 @@ void fragment() {
 	// whole-screen pop — the "clouds regenerate as I move" artifact.
 	float dt = max((cloud_outer - cloud_inner) / 14.0, seg / float(MAX_MARCH_STEPS));
 	int steps = int(clamp(ceil(seg / dt), 1.0, float(MAX_MARCH_STEPS)));
-	float jitter = hash3(vec3(FRAGCOORD.xy, 11.7)) - 0.5;
+	float jitter = (hash3(vec3(FRAGCOORD.xy, 11.7)) - 0.5) * 0.55;   // gentler dither → less grain
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
 	// Henyey-Greenstein-ish forward-scatter lobe: clouds brighten when the
