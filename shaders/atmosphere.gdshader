@@ -63,18 +63,34 @@ void fragment() {
 
 	vec2 atm = ray_sphere(cam, dir, planet_center, atmosphere_radius);
 	if (atm.y > 0.0) {
-		vec2 srf = ray_sphere(cam, dir, planet_center, planet_radius);
 		float t_enter = max(atm.x, 0.0);
 		float t_exit  = min(atm.y, scene_t);
 		bool have_depth = scene_t < 1e19;
-		if (srf.y > 0.0 && !have_depth) {
-			if (srf.x > 0.0) {
+		// The sea-level sphere clip exists ONLY to stop limb/space rays from
+		// integrating haze straight through the solid planet. When this pixel has
+		// a real depth hit, `scene_t` already bounds the integration at the true
+		// surface (terrain/water/moon, peaks included), so the sphere must NOT be
+		// used — doing so pushed t_enter out to the sphere exit whenever the camera
+		// sat below the sea-level sphere (i.e. near the ground), carving a no-haze
+		// band that hugged the surface while peaks rose through it. Skip it here.
+		// Sea-level sphere clip — a stand-in for the solid surface, but ONLY for
+		// pixels with no terrain depth AND ONLY from an ORBITAL camera (above the
+		// atmosphere shell). From out there a limb ray whose terrain LOD hasn't
+		// streamed would otherwise integrate haze straight through the planet.
+		//
+		// Inside the atmosphere (ground/flight) it must NOT run: the near-horizon
+		// SKY rays just above the terrain DO intersect the sea-level sphere, and
+		// clipping them at that near hit (srf.x) chopped the long low-altitude air
+		// column down to a tiny near-camera segment — a no-blue band hugging the
+		// horizon that popped in/out as the camera crossed the sea-level radius
+		// (so going lower OR higher restored it). Real occlusion near the ground is
+		// already handled by the terrain depth (scene_t) above.
+		float cam_radius = length(cam - planet_center);
+		if (!have_depth && cam_radius > atmosphere_radius) {
+			vec2 srf = ray_sphere(cam, dir, planet_center, planet_radius);
+			if (srf.x > 0.0 && srf.y > 0.0) {
 				t_exit = min(t_exit, srf.x);
-			} else {
-				t_enter = max(t_enter, srf.y);
 			}
-		} else if (srf.y > 0.0 && srf.x <= 0.0) {
-			t_enter = max(t_enter, srf.y);
 		}
 		if (t_exit > t_enter + 1e-3) {
 			float seg_len = t_exit - t_enter;
@@ -107,12 +123,18 @@ void fragment() {
 			vec3  sun_tint   = mix(vec3(1.0, 0.48, 0.18), vec3(1.0),
 			                       smoothstep(0.0, 0.42, sun_height));
 
-			vec3 rayleigh = rayleigh_color * optical_depth * scattering_strength * day * sun_tint;
+			// COLOUR is the saturated in-scatter HUE — it must NOT carry
+			// optical_depth. Coverage (out_a, below) already carries the path
+			// length via Beer–Lambert; baking optical_depth into the colour too
+			// made the visible blue fall off as optical_depth², so thin horizon
+			// paths from altitude collapsed to grey/black ("no haze") and only
+			// bloomed into blue once you descended. Hue here, amount in alpha.
+			vec3 rayleigh = rayleigh_color * scattering_strength * day * sun_tint;
 			vec3 mie      = mie_color      * mie_phase     * mie_strength       * day;
 			// Warm band toward the low sun.
 			float horizon_glow = smoothstep(0.55, 0.985, cos_a)
 			                   * (1.0 - smoothstep(0.08, 0.40, sun_height));
-			vec3 sunset = vec3(1.0, 0.42, 0.16) * horizon_glow * optical_depth
+			vec3 sunset = vec3(1.0, 0.42, 0.16) * horizon_glow
 			            * scattering_strength * day;
 
 			out_col = rayleigh + mie + sunset;
@@ -120,10 +142,27 @@ void fragment() {
 			// FULLY opaque — otherwise the atmosphere paints solid over the distant
 			// cloud deck and it looks hard-clipped at the horizon line. Capping lets
 			// the far clouds/terrain fade through the haze instead.
-			out_a   = clamp(max(optical_depth * 0.55, space_alpha), 0.0, 0.82);
-			// Let the bright sun disc punch THROUGH the shell (no blue/orange veil).
-			float sun_prox = smoothstep(0.985, 0.9999, cos_a);
-			out_a *= (1.0 - 0.92 * sun_prox);
+			// Beer–Lambert in-scatter saturation, NOT a linear ramp. The old
+			// `optical_depth * 0.55` sat flat near zero for thin, high-altitude
+			// view paths, so from altitude the surface below showed no haze at all
+			// and it only "kicked in" once you dropped close enough for the dense
+			// near-surface air to dominate the ray — reading as a hard gap between
+			// the atmosphere band and the ground. The exponential rises steeply for
+			// small optical depth (thin paths still tint) and saturates toward the
+			// cap for long horizon paths (the limb halo stays the same), so the haze
+			// now fades smoothly all the way down to the surface at any altitude.
+			out_a   = clamp(max(1.0 - exp(-optical_depth * 1.6), space_alpha), 0.0, 0.82);
+			// Let the bright sun disc punch THROUGH the shell (no blue/orange veil)
+			// when the sun is high. Two guards stop this from carving a hard no-haze
+			// band along the horizon at sunset:
+			//   * tight cone (0.9985 ≈ 3° vs the old 0.985 ≈ 10°) so only the disc
+			//     itself clears, not a wide patch of sky/horizon;
+			//   * faded out as the sun drops to the horizon (sun_height → 0), so the
+			//     low sun is correctly reddened/veiled by the thick horizon air
+			//     instead of punching a clear hole exactly where terrain meets sky.
+			float sun_prox = smoothstep(0.9985, 0.99995, cos_a);
+			sun_prox *= smoothstep(0.04, 0.30, sun_height);
+			out_a *= (1.0 - 0.85 * sun_prox);
 		}
 	}
 
