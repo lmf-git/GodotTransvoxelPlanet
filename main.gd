@@ -17,6 +17,8 @@ var _wireframe : bool = false
 # Which body the player is parented to / focused on. false = Earth-like planet
 # (the spawn default), true = moon. Toggled with [M].
 var _focus_moon : bool = false
+# Index of the settlement the camera last jumped to ([G] cycles through them).
+var _settlement_index : int = -1
 
 
 func _ready() -> void:
@@ -80,7 +82,7 @@ func _build_hud() -> void:
 	vbox.add_child(time_label)
 
 	var help := _make_label("")
-	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [M] planet/moon  [C] clouds  [`] wireframe  [Esc] release mouse"
+	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [M] planet/moon  [G] next town  [C] clouds  [`] wireframe  [Esc] release mouse"
 	help.modulate = Color(1, 1, 1, 0.75)
 	vbox.add_child(help)
 
@@ -123,6 +125,11 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo \
 			and (event as InputEventKey).keycode == KEY_M:
 		_set_focus_to_moon(not _focus_moon)
+	# [G] cycles the camera to the next settlement so you don't have to hunt for
+	# them. Only meaningful on the planet (the moon has no towns).
+	if event is InputEventKey and event.pressed and not event.echo \
+			and (event as InputEventKey).keycode == KEY_G:
+		_jump_to_next_settlement()
 
 
 # Reparent + reposition the player onto the planet (false) or the moon (true).
@@ -142,6 +149,39 @@ func _set_focus_to_moon(to_moon: bool) -> void:
 	player.look_at(target_system.global_position, Vector3.UP)
 	player.set_planet(target_planet)
 	player.velocity = Vector3.ZERO
+
+
+# Fly the camera to an oblique overhead view of the next settlement. Cycles
+# through every town on repeated presses. Placed BELOW the cloud deck bottom so
+# the town isn't hidden behind cloud, looking down at a slight angle so the
+# buildings read with height (a pure top-down shot flattens them).
+func _jump_to_next_settlement() -> void:
+	if _focus_moon:
+		return   # the moon has no settlements
+	var n := world.settlement_count()
+	if n == 0:
+		return
+	_settlement_index = (_settlement_index + 1) % n
+	var ground := world.settlement_world_pos(_settlement_index)
+	var ps := world.planet_system
+	var up := (ground - ps.global_position).normalized()
+	# A horizontal direction for the oblique offset (any tangent to the surface).
+	var tangent := up.cross(Vector3.FORWARD)
+	if tangent.length() < 0.01:
+		tangent = up.cross(Vector3.RIGHT)
+	tangent = tangent.normalized()
+	# Vantage: 280 m up + 360 m back along the surface — clear of the +400 m cloud
+	# base, ~450 m from the pad, a comfortable establishing shot of the town.
+	var cam_world := ground + up * 280.0 + tangent * 360.0
+	if mode_is_walk():
+		player.mode = FlightPlayer.Mode.FLIGHT
+	player.position = ps.to_local(cam_world)
+	player.velocity = Vector3.ZERO
+	player.look_at(ground, up)
+
+
+func mode_is_walk() -> bool:
+	return player.mode == FlightPlayer.Mode.WALK
 
 
 func _on_planet_stats(active: int, pending: int, tris: int, lod_violations: int) -> void:

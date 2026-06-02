@@ -28,6 +28,7 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, l
 @export var lod_factor    : float = 2.4          # subdivide when cam_dist < lod_factor * node_size
 @export var collision_lod_max : int = 1          # build collision for chunks at this LOD or below
 @export var scatter_lod_max : int = 1            # scatter props (rocks) on chunks at this LOD or below
+@export var enable_foliage  : bool = true        # grass/tree scatter — off for airless bodies (moon)
 @export var sea_level_offset : float = -12.0     # passed to scatter so it skips submerged triangles
 @export var max_new_chunks_per_tick  : int = 96   # raised: with thousands of chunks pending, 16/tick takes ~10 s to drain — far longer than the atomic-swap hold window, so cracks appear; pushing throughput keeps the visible frontier ahead of the camera
 @export var max_remesh_per_tick      : int = 128  # neighbour-mask re-meshes; prioritised so the atomic-swap gate releases fast
@@ -51,6 +52,8 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, l
 # MultiMeshInstance3D. Saves N MeshInstances and N materials across N chunks.
 var _scatter_mesh     : Mesh
 var _scatter_material : Material
+var _foliage_meshes   : Array = []   # per-biome plant meshes (TerrainScatter FT_* order)
+var _foliage_material : Material
 
 # Density field — typed loosely as Variant so we can plug in either
 # DensityField (Earth-like) or CraterDensity (Moon-like) without subclassing.
@@ -120,6 +123,9 @@ func _ready() -> void:
 		terrain_material = m
 	_scatter_mesh     = TerrainScatter.make_rock_mesh()
 	_scatter_material = TerrainScatter.make_rock_material()
+	if enable_foliage:
+		_foliage_meshes   = TerrainScatter.make_foliage_meshes()
+		_foliage_material = TerrainScatter.make_foliage_material()
 	_retraverse_threshold = base_chunk_size / float(voxel_resolution) * 0.5
 	_camera = _find_camera()
 
@@ -460,6 +466,8 @@ func _ensure_chunk(lod: int, coords: Vector3i, origin: Vector3, size: float) -> 
 		lod <= collision_lod_max)
 	rec.chunk.scatter_mesh     = _scatter_mesh
 	rec.chunk.scatter_material = _scatter_material
+	rec.chunk.foliage_meshes   = _foliage_meshes
+	rec.chunk.foliage_material = _foliage_material
 	rec.chunk.scatter_lod_max  = scatter_lod_max
 	rec.chunk.planet_radius_for_scatter = planet_radius
 	rec.chunk.sea_level_offset_for_scatter = sea_level_offset

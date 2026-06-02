@@ -26,7 +26,13 @@ uniform float polar_cap_fade       : hint_range(0.0, 0.5)        = 0.18;
 uniform float snow_altitude        : hint_range(-200.0, 1000.0)  = 240.0;
 uniform float snow_fade            : hint_range(1.0, 200.0)      = 70.0;
 uniform float equator_warmth       : hint_range(0.0, 1.0)        = 0.65;  // how much to bias equator away from snow
-uniform float beach_altitude       : hint_range(-100.0, 100.0)   = 8.0;
+// Lapse rate — temperature drops with altitude, so high peaks read cold (and
+// snow-capped) even at the equator. Without this, `temperature` was purely
+// latitude-driven, so equatorial mountain tops stayed "warm" and came out green
+// alpine instead of snow.
+uniform float lapse_rate           : hint_range(0.0, 1.0)        = 0.6;
+uniform float lapse_full_altitude  : hint_range(200.0, 3000.0)   = 1500.0; // altitude above sea where the drop saturates
+uniform float beach_altitude       : hint_range(-300.0, 100.0)   = 8.0;
 uniform float beach_fade           : hint_range(0.1, 100.0)      = 14.0;
 uniform float rock_slope_threshold : hint_range(0.0, 1.0)        = 0.30;
 uniform float rock_slope_fade      : hint_range(0.001, 0.5)      = 0.18;
@@ -182,7 +188,12 @@ void fragment() {
 	// `lat` is |dot(radial, axis)| where 0 = equator, 1 = pole — invert it.
 	// Add temp_anom so continents can be locally hotter/colder than their latitude
 	// would suggest (continental interiors, ocean currents — the visual stand-in).
-	float temperature = clamp(1.0 - lat + temp_anom, 0.0, 1.0);
+	// Lapse rate: subtract a 0→lapse_rate ramp as altitude climbs above sea
+	// (beach_altitude ≈ sea level). High ground becomes genuinely cold → alpine
+	// meadows, then bare alpine, then snow toward the peaks — real vertical biome
+	// zonation instead of one flat colour up the mountain.
+	float lapse = clamp((altitude - beach_altitude) / max(lapse_full_altitude, 1.0), 0.0, 1.0) * lapse_rate;
+	float temperature = clamp(1.0 - lat + temp_anom - lapse, 0.0, 1.0);
 	// Elevation index: 0 near sea, 1 at high alpine. Used as the LOW/HIGH axis.
 	float elev_t = smoothstep(0.0, 600.0, altitude);
 

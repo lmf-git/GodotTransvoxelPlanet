@@ -102,7 +102,13 @@ void fragment() {
 				vec3 p = cam + dir * t;
 				float h = (length(p - planet_center) - planet_radius)
 					/ max(atmosphere_radius - planet_radius, 1.0);
-				optical_depth += exp(-clamp(h, 0.0, 1.0) * 5.0);
+				// Softer vertical falloff (was *5.0). With *5 the haze density had all
+				// but vanished by ~half the shell height (~1500 m), so the cloud deck and
+				// upper air sat in visibly clear sky — "clouds above the atmosphere". *3
+				// keeps meaningful density up to ~2/3 of the shell (~2000–2400 m), so the
+				// blue haze encloses the cloud deck. The horizon (long near-surface path,
+				// h≈0) is unchanged — those samples integrate exp(0)=1 either way.
+				optical_depth += exp(-clamp(h, 0.0, 1.0) * 3.0);
 			}
 			optical_depth *= seg_len / float(SAMPLES) / max(atmosphere_radius - planet_radius, 1.0);
 

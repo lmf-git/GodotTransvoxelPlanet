@@ -69,6 +69,9 @@ var sun_light     : DirectionalLight3D
 var sun_visual    : MeshInstance3D
 var planet_system : Node3D
 var planet        : Planet
+# City pad centres in the planet's LOCAL frame (same `centers` handed to the
+# settlement builder). Cached so the camera-jump key can fly straight to a town.
+var settlement_centers : PackedVector3Array = PackedVector3Array()
 var atmosphere    : MeshInstance3D
 var water         : MeshInstance3D
 var clouds        : MeshInstance3D
@@ -142,13 +145,15 @@ func _normalize_shell_radii() -> void:
 	# the deck poking above the shell has no haze over it and shows a hard line
 	# where the atmosphere stops. Cloud top is +2800, so +3000 covers it.
 	atmosphere_radius  = planet_radius + 3000.0
-	# Fatter cloud deck (was 900–1900 = 1 km thick). A thin deck has almost no
-	# vertical room, so when you fly INTO it the clouds vanish just above/below
-	# you. 600–2800 (2.2 km) gives a real volume to fly through; the depth-clipped
-	# raymarch + softened vertical falloff fill it. The spawn altitude (+2500) now
-	# sits inside the deck, so you start among the clouds.
-	cloud_inner_radius = planet_radius + 600.0
-	cloud_outer_radius = planet_radius + 2800.0
+	# Cloud deck sits ABOVE the terrain peaks (real max ≈ +1576 m) so it reads as a
+	# continuous deck rather than being cut/clipped by every mountain that pokes
+	# through it — top at +1800 clears the peaks by ~220 m. The original "clouds
+	# float above the atmosphere" problem is fixed on the ATMOSPHERE side instead:
+	# the shader's vertical density falloff was softened (exp(-h*3) not *5) so the
+	# visible blue haze now extends up to ~+2000–2400 m and encloses this deck,
+	# instead of fading out by ~1500 m and leaving the clouds in clear air.
+	cloud_inner_radius = planet_radius + 500.0
+	cloud_outer_radius = planet_radius + 1800.0
 
 
 func _process(delta: float) -> void:
@@ -222,14 +227,11 @@ func _build_environment() -> void:
 	var env := Environment.new()
 	env.background_mode = Environment.BG_SKY
 	var sky := Sky.new()
-	var sky_mat := ProceduralSkyMaterial.new()
-	sky_mat.sky_top_color    = Color(0.004, 0.005, 0.012)
-	sky_mat.sky_horizon_color= Color(0.01, 0.012, 0.022)
-	sky_mat.sky_curve        = 0.4
-	sky_mat.ground_bottom_color  = Color(0.0, 0.0, 0.0)
-	sky_mat.ground_horizon_color = Color(0.0, 0.0, 0.0)
-	sky_mat.sun_angle_max    = 0.3
-	sky_mat.energy_multiplier = 0.4
+	# Custom deep-space sky: dark gradient + procedural starfield + galaxy band
+	# (shaders/stars.gdshader). Replaces the flat ProceduralSkyMaterial so orbit
+	# and night-side views show stars instead of a featureless black void.
+	var sky_mat := ShaderMaterial.new()
+	sky_mat.shader = load("res://shaders/stars.gdshader")
 	sky.sky_material = sky_mat
 	env.sky = sky
 	env.tonemap_mode = Environment.TONE_MAPPER_ACES
@@ -402,13 +404,27 @@ func _build_planet_system() -> void:
 	terrain_mat.set_shader_parameter("planet_center", Vector3.ZERO)
 	terrain_mat.set_shader_parameter("planet_radius", planet_radius)
 	terrain_mat.set_shader_parameter("polar_axis", Vector3.UP)
-	terrain_mat.set_shader_parameter("snow_altitude", planet_radius * 0.05)
+	# Altitudes in the terrain shader are measured from planet_radius (altitude =
+	# r - planet_radius), but SEA sits at planet_radius + sea_level_offset (−200).
+	# So all these thresholds are expressed relative to that −200 datum, otherwise
+	# (e.g. beach_altitude = 8) the "beach" band starts ~208 m above the waterline
+	# and paints sand across nearly all the low-lying land — which is exactly the
+	# "everything is sand" bug. Sand now only hugs the actual shoreline.
+	terrain_mat.set_shader_parameter("beach_altitude", sea_level_offset + 6.0)
+	terrain_mat.set_shader_parameter("beach_fade", 18.0)
+	# Snow line a few hundred metres above sea so mountains cap with snow. The
+	# shader also drops temperature with altitude (lapse rate), so high peaks read
+	# cold and get snow/ice even near the equator.
+	terrain_mat.set_shader_parameter("snow_altitude", sea_level_offset + 650.0)
+	terrain_mat.set_shader_parameter("snow_fade", 90.0)
 	terrain_mat.set_shader_parameter("polar_cap_latitude", 0.82)
 	terrain_mat.set_shader_parameter("polar_cap_fade", 0.10)
-	terrain_mat.set_shader_parameter("beach_altitude", 8.0)
-	terrain_mat.set_shader_parameter("beach_fade", 14.0)
+	# Lapse rate: high ground is colder. Reaches full strength ~1500 m above sea.
+	terrain_mat.set_shader_parameter("lapse_rate", 0.6)
+	terrain_mat.set_shader_parameter("lapse_full_altitude", 1500.0)
 	planet.terrain_material = terrain_mat
 	planet_system.add_child(planet)
+	_build_settlements()
 
 	# ── Atmosphere shell ───────────────────────────────────────────────────
 	atmosphere = MeshInstance3D.new()
@@ -512,6 +528,167 @@ func _build_planet_system() -> void:
 	planet_system.add_child(clouds)
 
 
+# Placeholder cities + roads. The Rust density flattens a disc at each city site
+# and a corridor along each road, so here we just drop visuals onto that flat
+# ground: a MultiMesh of box "buildings" per pad and a dark ribbon per road.
+# Parented under `planet` (the terrain's local, spinning frame) so they stay
+# locked to the surface. Queried from a throwaway NativeTerrain so the sites
+# match the exact pads the mesher carved (same seed + radius).
+func _build_settlements() -> void:
+	if not ClassDB.class_exists("NativeTerrain"):
+		return
+	var nt : Object = ClassDB.instantiate("NativeTerrain")
+	var data : Dictionary = nt.call("settlement_data", world_seed, planet_radius)
+	var centers : PackedVector3Array = data.get("centers", PackedVector3Array())
+	if centers.is_empty():
+		return
+	settlement_centers = centers
+	var road_points : PackedVector3Array = data.get("road_points", PackedVector3Array())
+	var road_steps : int = data.get("road_steps", 0)
+	var pad_radius : float = data.get("pad_radius", 200.0)
+
+	var root := Node3D.new()
+	root.name = "Settlements"
+
+	# ── Buildings — one shared MultiMesh of boxes across every pad ──────────
+	var box := BoxMesh.new()
+	box.size = Vector3.ONE
+	var bmat := StandardMaterial3D.new()
+	bmat.vertex_color_use_as_albedo = true
+	bmat.roughness = 0.85
+	bmat.metallic = 0.0
+
+	var xforms : Array[Transform3D] = []
+	var colors : Array[Color] = []
+	var rng := RandomNumberGenerator.new()
+	for ci in centers.size():
+		var center := centers[ci]
+		var pad_r := center.length()
+		if pad_r < 1.0:
+			continue
+		var up := center.normalized()
+		var tangent := up.cross(Vector3.RIGHT)
+		if tangent.length() < 0.01:
+			tangent = up.cross(Vector3.FORWARD)
+		tangent = tangent.normalized()
+		var bitan := up.cross(tangent).normalized()
+		rng.seed = world_seed ^ (ci * 0x9E3779B1)
+		var count := rng.randi_range(14, 26)
+		var spread := pad_radius * 0.78
+		for _bi in count:
+			var ox := rng.randf_range(-spread, spread)
+			var oz := rng.randf_range(-spread, spread)
+			if Vector2(ox, oz).length() > spread:
+				continue
+			var fx := rng.randf_range(8.0, 22.0)
+			var fz := rng.randf_range(8.0, 22.0)
+			var hy := rng.randf_range(12.0, 64.0)
+			var yaw := rng.randf_range(0.0, TAU)
+			var cs := cos(yaw)
+			var sn := sin(yaw)
+			var x_axis := (tangent * cs + bitan * sn) * fx
+			# z_axis = x_dir × up keeps the basis RIGHT-handed (x × y = z). The old
+			# (-tangent*sn + bitan*cs) made x × y = -z — a left-handed/mirrored basis,
+			# which flips triangle winding so cull_back drops the "front" faces (the
+			# boxes looked like they were missing sides).
+			var z_axis := (tangent * sn - bitan * cs) * fz
+			var y_axis := up * hy
+			# Drop the footprint onto the flat pad sphere, then lift the box so
+			# its base rests on the ground.
+			var ground := (center + tangent * ox + bitan * oz).normalized() * pad_r
+			var origin := ground + up * (hy * 0.5)
+			xforms.append(Transform3D(Basis(x_axis, y_axis, z_axis), origin))
+			var g := rng.randf_range(0.32, 0.66)
+			colors.append(Color(g, g * rng.randf_range(0.92, 1.04), g * rng.randf_range(0.86, 1.0)))
+
+	if xforms.size() > 0:
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_colors = true
+		mm.mesh = box
+		mm.instance_count = xforms.size()
+		for i in xforms.size():
+			mm.set_instance_transform(i, xforms[i])
+			mm.set_instance_color(i, colors[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.name = "Buildings"
+		mmi.multimesh = mm
+		mmi.material_override = bmat
+		root.add_child(mmi)
+
+	# ── Roads — a ribbon laid on each terrain-following centreline polyline ──
+	# `road_points` is every road's centreline (already at the carved ground
+	# height) concatenated, `road_steps` points per road. At each point the width
+	# direction is the surface tangent perpendicular to the local travel direction,
+	# so the ribbon banks with the ground instead of using one fixed arc-plane
+	# normal — it conforms to hills and bends.
+	if road_points.size() >= 2 and road_steps >= 2:
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var road_half := 16.0
+		var any_road := false
+		# road_points holds road_steps points per road, concatenated — an exact
+		# multiple; float-divide then truncate for the count without the warning.
+		var num_roads : int = int(road_points.size() / float(road_steps))
+		for r in num_roads:
+			var base : int = r * road_steps
+			var prev_l := Vector3.ZERO
+			var prev_r := Vector3.ZERO
+			for i in road_steps:
+				var cp := road_points[base + i]
+				var up := cp.normalized()
+				# Local travel direction from the neighbouring points.
+				var ahead : Vector3 = road_points[base + min(i + 1, road_steps - 1)]
+				var behind : Vector3 = road_points[base + max(i - 1, 0)]
+				var travel := (ahead - behind)
+				travel = (travel - up * travel.dot(up))   # project onto the surface
+				if travel.length() < 1e-4:
+					continue
+				travel = travel.normalized()
+				var nrm := up.cross(travel).normalized()   # width direction, on the surface
+				var center := cp + up * 1.5                # sit just above the ground
+				var lft := center + nrm * road_half
+				var rgt := center - nrm * road_half
+				if i > 0:
+					st.set_normal(up); st.add_vertex(prev_l)
+					st.set_normal(up); st.add_vertex(prev_r)
+					st.set_normal(up); st.add_vertex(lft)
+					st.set_normal(up); st.add_vertex(prev_r)
+					st.set_normal(up); st.add_vertex(rgt)
+					st.set_normal(up); st.add_vertex(lft)
+					any_road = true
+				prev_l = lft
+				prev_r = rgt
+		if any_road:
+			var rmesh := st.commit()
+			var rmi := MeshInstance3D.new()
+			rmi.name = "Roads"
+			rmi.mesh = rmesh
+			var rmat := StandardMaterial3D.new()
+			rmat.albedo_color = Color(0.12, 0.12, 0.13)
+			rmat.roughness = 0.95
+			rmat.metallic = 0.0
+			rmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+			rmi.material_override = rmat
+			root.add_child(rmi)
+
+	planet.add_child(root)
+
+
+# Number of placed settlements (0 if none / native extension absent).
+func settlement_count() -> int:
+	return settlement_centers.size()
+
+
+# World-space position of city pad `i`'s centre (on the ground). The pad centres
+# are stored in the planet's LOCAL frame and parented under `planet`, so the live
+# world position follows the planet as it spins/orbits.
+func settlement_world_pos(i: int) -> Vector3:
+	if i < 0 or i >= settlement_centers.size() or planet == null:
+		return Vector3.ZERO
+	return planet.global_transform * settlement_centers[i]
+
+
 func _build_moon() -> void:
 	moon_system = Node3D.new()
 	moon_system.name = "MoonSystem"
@@ -539,6 +716,7 @@ func _build_moon() -> void:
 	moon.lod_factor           = 2.4
 	moon.collision_lod_max    = 1
 	moon.scatter_lod_max      = -1     # disable scatter (no grass / rocks on the moon)
+	moon.enable_foliage       = false  # airless — no plants (also skips building the mesh)
 	moon.sea_level_offset     = 0.0    # no ocean → no submersion test
 	moon.terrain_material     = moon_material
 	moon.set_density(moon_density)

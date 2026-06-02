@@ -22,9 +22,11 @@ var planet_center : Vector3
 var build_collision : bool = false
 var material      : Material
 
-# Scatter (rocks). Disabled when scatter_mesh is null or LOD > scatter_lod_max.
+# Scatter (rocks + foliage). Disabled when the mesh is null or LOD > scatter_lod_max.
 var scatter_mesh     : Mesh        # shared rock mesh
 var scatter_material : Material    # shared rock material
+var foliage_meshes   : Array       # shared per-biome plant meshes (empty = no foliage, e.g. moon)
+var foliage_material : Material    # shared foliage material
 var scatter_lod_max  : int   = 1
 var planet_radius_for_scatter : float = 0.0
 var sea_level_offset_for_scatter : float = 0.0
@@ -44,6 +46,7 @@ var _mesh_instance : MeshInstance3D
 var _static_body   : StaticBody3D
 var _coll_shape    : CollisionShape3D
 var _scatter_mmi   : MultiMeshInstance3D
+var _foliage_mmis  : Array = []   # one MultiMeshInstance3D per foliage type (lazy)
 var _pending       : bool = false   # a native mesh job is in flight
 var _alive         : bool = true
 var _has_mesh      : bool = false
@@ -135,8 +138,9 @@ func _apply_mesh(result: Dictionary) -> void:
 		_remove_collision()
 		return
 
-	@warning_ignore("integer_division")
-	tri_count = indices.size() / 3
+	# Triangle soup → index count is a multiple of 3; exact float divide avoids the
+	# int/int truncation warning.
+	tri_count = int(indices.size() / 3.0)
 	_ensure_mesh_instance()
 	var mesh := ArrayMesh.new()
 	var arr := []
@@ -170,47 +174,65 @@ func _apply_mesh(result: Dictionary) -> void:
 
 func _update_scatter(positions: PackedVector3Array, normals: PackedVector3Array,
 		indices: PackedInt32Array) -> void:
-	if scatter_mesh == null or lod > scatter_lod_max:
-		# Clear any leftover scatter (e.g. if this chunk had it before and
-		# then we downgraded — rare, but cheap to handle).
+	# Scatter is only for the near (fine) chunks. Beyond scatter_lod_max, hide any
+	# leftover instances and bail.
+	if lod > scatter_lod_max:
 		if _scatter_mmi:
 			_scatter_mmi.visible = false
+		for m in _foliage_mmis:
+			if m:
+				m.visible = false
 		return
 	var coords_seed := hash([int(origin.x), int(origin.y), int(origin.z), lod])
-	var xforms := TerrainScatter.build_rock_transforms(
-		positions, normals, indices,
-		planet_center, planet_radius_for_scatter,
-		sea_level_offset_for_scatter, coords_seed)
-	@warning_ignore("integer_division")
-	var count : int = xforms.size() / 12
+
+	# ── Rocks ──────────────────────────────────────────────────────────────
+	if scatter_mesh != null:
+		var rx := TerrainScatter.build_rock_transforms(
+			positions, normals, indices,
+			planet_center, planet_radius_for_scatter,
+			sea_level_offset_for_scatter, coords_seed)
+		_scatter_mmi = _apply_stream(_scatter_mmi, scatter_mesh, scatter_material, rx)
+
+	# ── Foliage — one MultiMesh per biome plant type. Decorrelated seed so it
+	#    doesn't land on the same triangles as the rocks.
+	if not foliage_meshes.is_empty():
+		var streams := TerrainScatter.build_foliage_streams(
+			positions, normals, indices,
+			planet_center, planet_radius_for_scatter,
+			sea_level_offset_for_scatter, coords_seed ^ 0x5BD1E5)
+		if _foliage_mmis.size() != foliage_meshes.size():
+			_foliage_mmis.resize(foliage_meshes.size())
+		for t in foliage_meshes.size():
+			_foliage_mmis[t] = _apply_stream(
+				_foliage_mmis[t], foliage_meshes[t], foliage_material, streams[t])
+
+
+# Push a 12-float-per-instance transform buffer into a MultiMeshInstance (created
+# lazily), or hide it if empty. Returns the (possibly newly-created) instance.
+# The buffer is already in MultiMesh TRANSFORM_3D order, so it's one assignment.
+func _apply_stream(mmi: MultiMeshInstance3D, mesh: Mesh, mat: Material,
+		xforms: PackedFloat32Array) -> MultiMeshInstance3D:
+	# 12 floats per instance (3×4 transform), so the length is a multiple of 12.
+	var count : int = int(xforms.size() / 12.0)
 	if count == 0:
-		if _scatter_mmi:
-			_scatter_mmi.visible = false
-		return
-	_ensure_scatter_mmi()
-	var mm : MultiMesh = _scatter_mmi.multimesh
-	mm.instance_count = count
-	# build_rock_transforms already lays each instance out as 12 floats in the
-	# exact MultiMesh TRANSFORM_3D buffer order (3 rows of 4), so we can hand the
-	# whole array over in one assignment instead of rebuilding a Basis +
-	# Transform3D and calling set_instance_transform() per rock.
-	mm.buffer = xforms
-	_scatter_mmi.visible = true
-
-
-func _ensure_scatter_mmi() -> void:
-	if _scatter_mmi != null:
-		return
-	_scatter_mmi = MultiMeshInstance3D.new()
-	var mm := MultiMesh.new()
-	mm.transform_format = MultiMesh.TRANSFORM_3D
-	mm.mesh = scatter_mesh
-	_scatter_mmi.multimesh = mm
-	_scatter_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	_scatter_mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
-	if scatter_material:
-		_scatter_mmi.material_override = scatter_material
-	add_child(_scatter_mmi)
+		if mmi:
+			mmi.visible = false
+		return mmi
+	if mmi == null:
+		mmi = MultiMeshInstance3D.new()
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = mesh
+		mmi.multimesh = mm
+		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		if mat:
+			mmi.material_override = mat
+		add_child(mmi)
+	mmi.multimesh.instance_count = count
+	mmi.multimesh.buffer = xforms
+	mmi.visible = true
+	return mmi
 
 
 func _ensure_mesh_instance() -> void:

@@ -192,6 +192,39 @@ impl NativeTerrain {
         Vector2::new(density.min_surface_radius(), density.max_surface_radius())
     }
 
+    /// Deterministic placeholder settlements for this body — the same city pads
+    /// and road corridors that `PlanetDensity` flattens into the terrain, handed
+    /// to GDScript so it can drop building/road visuals exactly on the flat ground.
+    /// Returns { centers: PackedVector3Array (local-frame pad centres),
+    /// roads: PackedVector3Array (endpoint pairs a0,b0,a1,b1,…), pad_radius }.
+    #[func]
+    fn settlement_data(&self, seed: i64, radius: f64) -> VarDictionary {
+        let density = PlanetDensity::new(seed as i32, radius as f32);
+        let mut centers: Vec<Vector3> = Vec::new();
+        for c in density.cities() {
+            centers.push(Vector3::new(
+                c.dir[0] * c.target_r,
+                c.dir[1] * c.target_r,
+                c.dir[2] * c.target_r,
+            ));
+        }
+        // Road centrelines sampled at terrain height: `road_steps` points per
+        // road, all roads concatenated. GDScript slices by `road_steps` and lays a
+        // ribbon along each polyline so the road conforms to the ground it was
+        // carved into (instead of a straight pad-to-pad ramp floating over hills).
+        let road_steps: usize = 24;
+        let pts = density.road_polylines(road_steps);
+        let road_points: Vec<Vector3> =
+            pts.iter().map(|p| Vector3::new(p[0], p[1], p[2])).collect();
+
+        let mut dict = VarDictionary::new();
+        dict.set("centers", PackedVector3Array::from(centers.as_slice()));
+        dict.set("road_points", PackedVector3Array::from(road_points.as_slice()));
+        dict.set("road_steps", (road_steps + 1) as i64);
+        dict.set("pad_radius", density.city_pad_radius() as f64);
+        dict
+    }
+
     /// Drain ALL finished meshes in a single call. Returns an Array of
     /// Dictionaries, each = { id, positions, normals, indices, empty }. One lock
     /// + one FFI hop for the whole batch (vs a poll + a take-per-chunk round-trip
