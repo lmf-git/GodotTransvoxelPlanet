@@ -93,4 +93,5 @@ toggle_wireframe={
 
 lights_and_shadows/directional_shadow/soft_shadow_filter_quality=3
 camera/depth_of_field/depth_of_field_bokeh_quality=2
-anti_aliasing/quality/msaa_3d=2
+anti_aliasing/quality/msaa_3d=1
+occlusion_culling/use_occlusion_culling=true

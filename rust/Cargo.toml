@@ -21,3 +21,8 @@ godot = "=0.4.5"
 [profile.release]
 opt-level = 3
 lto = "thin"
+# One codegen unit lets LLVM inline across the whole crate (the meshing / noise
+# inner loops benefit). NOT `panic = "abort"`: gdext relies on unwinding to catch
+# panics at the FFI boundary and surface them as Godot errors instead of killing
+# the editor/game.
+codegen-units = 1

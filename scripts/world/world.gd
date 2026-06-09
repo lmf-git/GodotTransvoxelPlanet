@@ -29,16 +29,23 @@ extends Node3D
 ## inside single-precision float comfort. For real-AU-scale orbits you'd want
 ## a floating-origin system; that's out of scope here.
 
-@export var planet_radius     : float = 4000.0
+# The single size knob. main.gd (the entry scene) sets this to 24000 at runtime; the
+# default matches so a standalone/editor World isn't a different scale. The Rust
+# density (settlements, erosion) only activate above ~10000, so this MUST stay large.
+# The atmosphere/cloud radii below are DERIVED from this in _normalize_shell_radii —
+# their literals here are placeholders that _ready overwrites.
+@export var planet_radius     : float = 24000.0
 @export var atmosphere_radius : float = 4520.0
-@export var cloud_inner_radius : float = 4180.0   # bottom of the volumetric cloud deck
-@export var cloud_outer_radius : float = 4420.0   # top of the deck (inside the atmosphere shell)
+@export var cloud_inner_radius : float = 4180.0   # bottom of the volumetric cloud deck (derived in _ready)
+@export var cloud_outer_radius : float = 4420.0   # top of the deck (inside the atmosphere shell) (derived in _ready)
 @export var sea_level_offset  : float = -200.0    # SEA 200 m below planet_radius. Mean continent height with the -0.55 bias / 380 multiplier is around -209 m, so the previous offset of 0 left the average surface well under water — only noise>0.32 areas surfaced. -200 puts sea AT roughly the mean surface so ~50% of the planet is land, dropping below for ocean basins and rising into continents/mountains above.
 @export var world_seed        : int   = 1337
 
 @export var orbit_radius      : float = 1800000.0 # sun is far away (≈75× planet radius) — scaled with planet
-@export var orbit_period_sec  : float = 600.0     # one full revolution
-@export var day_length_sec    : float = 480.0     # one full axial rotation (slower → shadows don't shimmer)
+@export var orbit_period_sec  : float = 24000.0   # one full revolution = one "year". MUST be ≫ day_length or the
+												  # orbit whips the sun around faster than the planet spins (the old
+												  # 600 s made a year ≈ a day). 24000 s ≈ 20 in-game days per year.
+@export var day_length_sec    : float = 1200.0    # one full axial rotation = ~20 min day/night (was 480 = 8 min, too fast)
 @export var axial_tilt_deg    : float = 23.5      # like Earth
 @export var sun_radius        : float = 78000.0   # scaled with orbit_radius so the disc keeps its apparent size (still clearly visible + glows)
 @export var sun_color         : Color = Color(1.0, 0.93, 0.78)
@@ -50,9 +57,9 @@ extends Node3D
 # since the moon is much smaller than the planet.
 @export var moon_radius          : float = 3300.0
 @export var moon_orbit_radius    : float = 450000.0   # far out (≈19× planet radius); at this distance it reads as a small disc like the real Moon
-@export var moon_orbit_period_sec: float = 200.0
+@export var moon_orbit_period_sec: float = 4800.0   # ~4 in-game days per lunar orbit (was 200 = zipped across the sky)
 @export var moon_inclination_deg : float = 8.0
-@export var moon_spin_period_sec : float = 200.0    # tidally locked by default (same as orbit)
+@export var moon_spin_period_sec : float = 4800.0   # tidally locked by default (same as orbit)
 @export var moon_seed            : int   = 42
 @export var moon_crater_count    : int   = 260
 @export var moon_max_lod         : int   = 5
@@ -164,6 +171,37 @@ func _process(delta: float) -> void:
 	_maybe_shift_origin()
 	_update_transforms()
 	_update_underwater()
+	_update_cloud_quality(delta)
+
+
+# ── Cloud quality auto-LOD ────────────────────────────────────────────────────
+# The volumetric deck is the single most expensive draw (a full-screen raymarch).
+# Rather than a fixed cost, drive the shader's `quality` uniform from the actual
+# frame rate: sag below the floor → step the march budget down (to ~half cost);
+# comfortable headroom → step it back up. Asymmetric steps + a half-second cadence
+# give hysteresis so it settles instead of oscillating.
+const CLOUD_Q_MIN := 0.45
+const CLOUD_Q_FPS_LOW := 30.0    # below this, degrade
+const CLOUD_Q_FPS_HIGH := 50.0   # above this, restore
+var _cloud_quality : float = 1.0
+var _cloud_q_timer : float = 0.0
+
+func _update_cloud_quality(delta: float) -> void:
+	if cloud_mat == null or clouds == null or not clouds.visible:
+		return
+	_cloud_q_timer += delta
+	if _cloud_q_timer < 0.5:
+		return
+	_cloud_q_timer = 0.0
+	var fps := Engine.get_frames_per_second()
+	var q := _cloud_quality
+	if fps < CLOUD_Q_FPS_LOW:
+		q = maxf(q - 0.1, CLOUD_Q_MIN)
+	elif fps > CLOUD_Q_FPS_HIGH:
+		q = minf(q + 0.05, 1.0)
+	if absf(q - _cloud_quality) > 0.001:
+		_cloud_quality = q
+		cloud_mat.set_shader_parameter("quality", q)
 
 
 # Floating-origin recentre. When the active camera drifts past
@@ -276,6 +314,16 @@ func _build_environment() -> void:
 	env.adjustment_brightness = 0.98   # near-neutral: the old 0.85 leaned on glow_bloom's wash to brighten the scene; with the wash gone, knocking the frame down here was making the terrain read dim. 0.98 keeps a hair of deep-space contrast without crushing it
 	env.adjustment_contrast = 1.08
 	env.adjustment_saturation = 1.1
+	# Screen-space ambient occlusion — contact shadows in terrain crevices and
+	# around rocks / foliage bases / buildings, which grounds everything on foot
+	# (no effect from orbit, where geometry is sub-pixel). Radius is metres, sized
+	# for surface-scale relief; kept moderate so it reads as soft dirt-shadow, not a
+	# hard outline. One screen pass — cheap on modern GPUs, and free far away.
+	env.ssao_enabled = true
+	env.ssao_radius = 2.5
+	env.ssao_intensity = 2.0
+	env.ssao_power = 1.5
+	env.ssao_detail = 0.5
 	world_env = WorldEnvironment.new()
 	world_env.environment = env
 	add_child(world_env)
@@ -422,9 +470,15 @@ func _build_planet_system() -> void:
 	# Lapse rate: high ground is colder. Reaches full strength ~1500 m above sea.
 	terrain_mat.set_shader_parameter("lapse_rate", 0.6)
 	terrain_mat.set_shader_parameter("lapse_full_altitude", 1500.0)
+	# Procedurally-generated seamless PBR ground-detail texture (no files). Fed to the
+	# terrain shader, which triplanar-samples it for albedo grain + roughness + the
+	# micro-normal, so biomes read as real material surfaces close up.
+	terrain_mat.set_shader_parameter("detail_grain_tex", _make_detail_grain_texture())
 	planet.terrain_material = terrain_mat
 	planet_system.add_child(planet)
 	_build_settlements()
+	_build_rivers()
+	_build_landmarks()
 
 	# ── Atmosphere shell ───────────────────────────────────────────────────
 	atmosphere = MeshInstance3D.new()
@@ -534,6 +588,26 @@ func _build_planet_system() -> void:
 # Parented under `planet` (the terrain's local, spinning frame) so they stay
 # locked to the surface. Queried from a throwaway NativeTerrain so the sites
 # match the exact pads the mesher carved (same seed + radius).
+# Procedurally build a seamless tileable grain texture from layered noise — the PBR
+# ground-detail map the terrain shader triplanar-samples (drives albedo grain,
+# roughness variation and the micro-normal). No texture files: generated at load;
+# NoiseTexture2D fills on a background thread, the shader uses white until ready.
+func _make_detail_grain_texture() -> NoiseTexture2D:
+	var tex := NoiseTexture2D.new()
+	tex.width = 256
+	tex.height = 256
+	tex.seamless = true
+	tex.generate_mipmaps = true
+	var n := FastNoiseLite.new()
+	n.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	n.frequency = 0.035
+	n.fractal_octaves = 4
+	n.fractal_gain = 0.55
+	n.seed = 1234
+	tex.noise = n
+	return tex
+
+
 func _build_settlements() -> void:
 	if not ClassDB.class_exists("NativeTerrain"):
 		return
@@ -545,12 +619,21 @@ func _build_settlements() -> void:
 	settlement_centers = centers
 	var road_points : PackedVector3Array = data.get("road_points", PackedVector3Array())
 	var road_steps : int = data.get("road_steps", 0)
-	var pad_radius : float = data.get("pad_radius", 200.0)
+	var pad_radius : float = data.get("pad_radius", 200.0)   # the CITY pad size (fallback)
+	# Per-settlement pad radius (cities are large, towns smaller). Parallel to centers.
+	var pad_radii : PackedFloat32Array = data.get("pad_radii", PackedFloat32Array())
+	# (Scatter keep-out around pads/roads is handled in Rust now — density.in_settlement.)
 
 	var root := Node3D.new()
 	root.name = "Settlements"
 
-	# ── Buildings — one shared MultiMesh of boxes across every pad ──────────
+	# ── City ground: pavement disc + street grid + grid-aligned buildings ─────
+	# Each pad is locally flat (pad_radius ≪ pad_r), so we work in a tangent frame
+	# and project footprints back onto the sphere for curvature. A light concrete
+	# disc is laid first, a darker street grid on top, then buildings fill the
+	# blocks between the streets — so a town reads as a paved settlement rather
+	# than boxes floating on grass. Pavement + streets are each one merged mesh
+	# across all pads; buildings share one MultiMesh of unit boxes.
 	var box := BoxMesh.new()
 	box.size = Vector3.ONE
 	var bmat := StandardMaterial3D.new()
@@ -558,48 +641,209 @@ func _build_settlements() -> void:
 	bmat.roughness = 0.85
 	bmat.metallic = 0.0
 
+	var street_st := SurfaceTool.new()
+	street_st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var any_street := false
+
 	var xforms : Array[Transform3D] = []
 	var colors : Array[Color] = []
 	var rng := RandomNumberGenerator.new()
+
+	const CELL := 46.0          # block pitch — street centreline to street centreline
+	const STREET_HALF := 5.0    # in-town road half-width
+	const PAVE_FRAC := 0.92     # paved disc radius as a fraction of the pad radius
+
 	for ci in centers.size():
 		var center := centers[ci]
 		var pad_r := center.length()
 		if pad_r < 1.0:
 			continue
+		# This settlement's pad radius (cities large, towns ~half) and a 0..1 size
+		# factor used to scale block density + building height so towns read smaller.
+		var pad_radius_i : float = pad_radii[ci] if ci < pad_radii.size() else pad_radius
+		var size_scale : float = clampf(pad_radius_i / 280.0, 0.25, 1.0)
 		var up := center.normalized()
 		var tangent := up.cross(Vector3.RIGHT)
 		if tangent.length() < 0.01:
 			tangent = up.cross(Vector3.FORWARD)
 		tangent = tangent.normalized()
 		var bitan := up.cross(tangent).normalized()
+		var pave_r := pad_radius_i * PAVE_FRAC
 		rng.seed = world_seed ^ (ci * 0x9E3779B1)
-		var count := rng.randi_range(14, 26)
-		var spread := pad_radius * 0.78
-		for _bi in count:
-			var ox := rng.randf_range(-spread, spread)
-			var oz := rng.randf_range(-spread, spread)
-			if Vector2(ox, oz).length() > spread:
+		# Per-city grid orientation: rotate the local frame by a random yaw so towns
+		# don't all share the same axis-aligned street grid. Pavement/streets/buildings
+		# and the height samples all use (tangent, bitan), so one rotation turns the
+		# whole layout coherently.
+		var grid_yaw := rng.randf_range(0.0, TAU)
+		var _gt := tangent * cos(grid_yaw) + bitan * sin(grid_yaw)
+		bitan = -tangent * sin(grid_yaw) + bitan * cos(grid_yaw)
+		tangent = _gt
+
+		# Incoming highway segments near this pad. Used below to keep buildings off
+		# the avenue the highway takes into town (otherwise the inter-city road runs
+		# straight through the building grid). road_points holds road_steps points
+		# per road, concatenated.
+		var hwy_a := PackedVector3Array()
+		var hwy_b := PackedVector3Array()
+		if road_steps >= 2 and road_points.size() >= road_steps:
+			var nrds : int = int(road_points.size() / float(road_steps))
+			for rr in nrds:
+				var rb : int = rr * road_steps
+				for si in road_steps - 1:
+					var sa := road_points[rb + si]
+					var sb := road_points[rb + si + 1]
+					if center.distance_to((sa + sb) * 0.5) < pad_radius_i + 40.0:
+						hwy_a.append(sa)
+						hwy_b.append(sb)
+
+		# Sample the REAL carved ground across the pad in ONE native call, so the town
+		# drapes onto the terrain (the pad is near-flat now) instead of a stamped flat
+		# disc. A GRID×GRID height field over [-pad_radius, pad_radius] is then bilinear-
+		# sampled by pad_point, so pavement / streets / buildings all follow the ground.
+		# Finer grid (was 25) tracks the mesh more closely, so the foundation sits flush
+		# instead of floating over the gaps the coarse grid smoothed across.
+		var grid := 31
+		var span := pad_radius_i
+		var gdirs := PackedVector3Array()
+		gdirs.resize(grid * grid)
+		for gz in grid:
+			for gx in grid:
+				var ox0 := (float(gx) / float(grid - 1) * 2.0 - 1.0) * span
+				var oz0 := (float(gz) / float(grid - 1) * 2.0 - 1.0) * span
+				gdirs[gz * grid + gx] = (center + tangent * ox0 + bitan * oz0).normalized()
+		var gheights : PackedFloat32Array = nt.call("surface_radii", world_seed, planet_radius, gdirs)
+
+		# Local (tangent, bitan) offset → point on the CARVED ground, lifted by `h`.
+		var pad_point := func(ox: float, oz: float, h: float) -> Vector3:
+			var fx : float = clampf((ox / span * 0.5 + 0.5) * float(grid - 1), 0.0, float(grid - 1))
+			var fz : float = clampf((oz / span * 0.5 + 0.5) * float(grid - 1), 0.0, float(grid - 1))
+			var x0 := int(fx)
+			var z0 := int(fz)
+			var x1 : int = min(x0 + 1, grid - 1)
+			var z1 : int = min(z0 + 1, grid - 1)
+			var tx := fx - float(x0)
+			var tz := fz - float(z0)
+			var h0 : float = lerp(gheights[z0 * grid + x0], gheights[z0 * grid + x1], tx)
+			var h1 : float = lerp(gheights[z1 * grid + x0], gheights[z1 * grid + x1], tx)
+			var surf : float = lerp(h0, h1, tz)
+			return (center + tangent * ox + bitan * oz).normalized() * (surf + h)
+
+		# NO concrete disc — the city's ground is the URBAN TERRAIN the shader paints
+		# (from the per-vertex settlement factor baked into the mesh) plus the dark
+		# street grid and the buildings. The streets are laid straight on that ground.
+		var n := int(pave_r / CELL)
+		for gi in range(-n, n + 1):
+			var off := float(gi) * CELL
+			if absf(off) >= pave_r:
 				continue
-			var fx := rng.randf_range(8.0, 22.0)
-			var fz := rng.randf_range(8.0, 22.0)
-			var hy := rng.randf_range(12.0, 64.0)
-			var yaw := rng.randf_range(0.0, TAU)
-			var cs := cos(yaw)
-			var sn := sin(yaw)
-			var x_axis := (tangent * cs + bitan * sn) * fx
-			# z_axis = x_dir × up keeps the basis RIGHT-handed (x × y = z). The old
-			# (-tangent*sn + bitan*cs) made x × y = -z — a left-handed/mirrored basis,
-			# which flips triangle winding so cull_back drops the "front" faces (the
-			# boxes looked like they were missing sides).
-			var z_axis := (tangent * sn - bitan * cs) * fz
-			var y_axis := up * hy
-			# Drop the footprint onto the flat pad sphere, then lift the box so
-			# its base rests on the ground.
-			var ground := (center + tangent * ox + bitan * oz).normalized() * pad_r
-			var origin := ground + up * (hy * 0.5)
-			xforms.append(Transform3D(Basis(x_axis, y_axis, z_axis), origin))
-			var g := rng.randf_range(0.32, 0.66)
-			colors.append(Color(g, g * rng.randf_range(0.92, 1.04), g * rng.randf_range(0.86, 1.0)))
+			var half_len : float = sqrt(maxf(pave_r * pave_r - off * off, 0.0))
+			_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, true, up)
+			_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, false, up)
+			any_street = true
+
+		# Buildings: each block is SUBDIVIDED into a small grid of lots, each with its
+		# own building, so a block is shared by several buildings (a real city block)
+		# rather than one box in an empty square. Lots fill most of their footprint,
+		# separated by narrow alleys; heights vary for a real skyline.
+		# Buildings, zoned into DISTRICTS by distance from the centre: a dense high-rise
+		# CORE, a low-rise RESIDENTIAL ring, and a sparse INDUSTRIAL fringe of wide low
+		# sheds — so a town reads as a real city with a skyline and a periphery, not a
+		# uniform box grid. Each block is subdivided into lots; core lots grow tiered
+		# towers (boxes stepped inward as they rise), the ring stays low-rise, the fringe
+		# is warehouses.
+		for bi in range(-n, n):
+			for bj in range(-n, n):
+				var bx := (float(bi) + 0.5) * CELL
+				var bz := (float(bj) + 0.5) * CELL
+				var bdist : float = Vector2(bx, bz).length()
+				if bdist > pave_r - CELL * 0.55:
+					continue
+				if rng.randf() < 0.05:
+					continue   # leave the odd block open for a plaza / park
+				# District factor (0 = core, 1 = fringe) with a little noise so the rings
+				# interlock instead of forming perfect concentric bands.
+				var zt : float = clampf(bdist / pave_r + rng.randf_range(-0.10, 0.10), 0.0, 1.0)
+				var block := CELL - STREET_HALF * 2.0
+				var subx : int
+				var subz : int
+				var fill_lo : float
+				var fill_hi : float
+				var h_lo : float
+				var h_hi : float
+				var vacancy : float
+				var tiered := false
+				var industrial := false
+				if zt < 0.32:
+					# Core: dense small lots, tall tiered towers.
+					subx = rng.randi_range(2, 3); subz = rng.randi_range(2, 3)
+					fill_lo = 0.80; fill_hi = 0.95
+					h_lo = 34.0; h_hi = lerp(60.0, 150.0, size_scale)
+					vacancy = 0.05; tiered = true
+				elif zt < 0.68:
+					# Residential ring: low/mid-rise, denser.
+					subx = rng.randi_range(2, 3); subz = rng.randi_range(2, 3)
+					fill_lo = 0.66; fill_hi = 0.86
+					h_lo = 8.0; h_hi = lerp(16.0, 34.0, size_scale)
+					vacancy = 0.12
+				else:
+					# Industrial / outskirts: big lots, wide low warehouses, sparse.
+					subx = rng.randi_range(1, 2); subz = rng.randi_range(1, 2)
+					fill_lo = 0.82; fill_hi = 0.97
+					h_lo = 7.0; h_hi = 16.0
+					vacancy = 0.30; industrial = true
+				var lotx := block / float(subx)
+				var lotz := block / float(subz)
+				for sx in subx:
+					for sz in subz:
+						if rng.randf() < vacancy:
+							continue   # courtyard / vacant lot
+						var lox := bx + (float(sx) - (subx - 1) * 0.5) * lotx
+						var loz := bz + (float(sz) - (subz - 1) * 0.5) * lotz
+						var ground : Vector3 = pad_point.call(lox, loz, 0.0)
+						# Skip lots the highway avenue runs through.
+						if _near_segment(ground, hwy_a, hwy_b, 22.0):
+							continue
+						# Footprint fills most of the lot, leaving a narrow alley.
+						var fx := lotx * rng.randf_range(fill_lo, fill_hi)
+						var fz := lotz * rng.randf_range(fill_lo, fill_hi)
+						var yaw := rng.randf_range(-0.04, 0.04)   # near grid-aligned
+						var dir_x := tangent * cos(yaw) + bitan * sin(yaw)
+						# dir_z = x_dir rotated −90° about up, so x × y stays right-handed.
+						var dir_z := tangent * sin(yaw) - bitan * cos(yaw)
+						# Embed the base into the slope so the downhill side doesn't float.
+						var embed : float = maxf(fx, fz) * 0.12
+						var bottom := ground - up * embed   # box base sits here
+						var hy := rng.randf_range(h_lo, maxf(h_hi, h_lo + 2.0))
+						xforms.append(Transform3D(
+								Basis(dir_x * fx, up * hy, dir_z * fz), bottom + up * (hy * 0.5)))
+						colors.append(_building_color(hy, zt, industrial, rng))
+						# Tiered setbacks: core towers step inward as they rise.
+						if tiered and hy > 60.0:
+							var top := bottom + up * hy
+							var tfx := fx
+							var tfz := fz
+							for _t in rng.randi_range(1, 2):
+								tfx *= rng.randf_range(0.55, 0.74)
+								tfz *= rng.randf_range(0.55, 0.74)
+								var th := rng.randf_range(14.0, 34.0)
+								xforms.append(Transform3D(
+										Basis(dir_x * tfx, up * th, dir_z * tfz), top + up * (th * 0.5)))
+								colors.append(_building_color(hy, zt, industrial, rng))
+								top += up * th
+
+	# City streets — one merged dark mesh across all pads, laid on the urban ground.
+	if any_street:
+		var smat := StandardMaterial3D.new()
+		smat.albedo_color = Color(0.13, 0.13, 0.14)
+		smat.roughness = 0.95
+		smat.metallic = 0.0
+		smat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		var smi := MeshInstance3D.new()
+		smi.name = "CityStreets"
+		smi.mesh = street_st.commit()
+		smi.material_override = smat
+		root.add_child(smi)
+		_attach_trimesh_collider(smi)
 
 	if xforms.size() > 0:
 		var mm := MultiMesh.new()
@@ -615,6 +859,28 @@ func _build_settlements() -> void:
 		mmi.multimesh = mm
 		mmi.material_override = bmat
 		root.add_child(mmi)
+		# Collision: one combined trimesh of every building box so the walk-mode
+		# player can't pass through them. Static + broadphase-culled, so a single
+		# global body is fine (no per-instance bodies, no LOD needed).
+		var bfaces := PackedVector3Array()
+		var corners := [
+			Vector3(-0.5, -0.5, -0.5), Vector3(0.5, -0.5, -0.5), Vector3(0.5, -0.5, 0.5), Vector3(-0.5, -0.5, 0.5),
+			Vector3(-0.5, 0.5, -0.5), Vector3(0.5, 0.5, -0.5), Vector3(0.5, 0.5, 0.5), Vector3(-0.5, 0.5, 0.5),
+		]
+		var btris := [0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7, 4, 5, 6, 4, 6, 7, 3, 2, 1, 3, 1, 0]
+		for xf in xforms:
+			for ti in btris:
+				bfaces.append(xf * corners[ti])
+		if bfaces.size() >= 3:
+			var bshape := ConcavePolygonShape3D.new()
+			bshape.set_faces(bfaces)
+			var bbody := StaticBody3D.new()
+			bbody.collision_layer = 1
+			bbody.collision_mask = 0
+			var bcs := CollisionShape3D.new()
+			bcs.shape = bshape
+			bbody.add_child(bcs)
+			mmi.add_child(bbody)
 
 	# ── Roads — a ribbon laid on each terrain-following centreline polyline ──
 	# `road_points` is every road's centreline (already at the carved ground
@@ -630,26 +896,47 @@ func _build_settlements() -> void:
 		# road_points holds road_steps points per road, concatenated — an exact
 		# multiple; float-divide then truncate for the count without the warning.
 		var num_roads : int = int(road_points.size() / float(road_steps))
+		# Run the ribbon in to a small central plaza (not the pavement edge) so the
+		# highways from several towns CONVERGE at the centre — a crossroads — instead
+		# of each ending as a separate stub at the rim. Across the pad the carved
+		# ground is the flat pad height and the ribbon (lifted) rides above the
+		# pavement/street grid as the main avenue (buildings are already cleared from
+		# its path). Stopping a little short of the exact centre leaves a plaza and
+		# avoids the converging ribbons overlapping into a z-fighting blob.
+		var plaza_r := 32.0
 		for r in num_roads:
 			var base : int = r * road_steps
 			var prev_l := Vector3.ZERO
 			var prev_r := Vector3.ZERO
+			var has_prev := false
 			for i in road_steps:
 				var cp := road_points[base + i]
 				var up := cp.normalized()
+				var in_plaza := false
+				for c in centers:
+					if cp.distance_to(c) < plaza_r:
+						in_plaza = true
+						break
+				if in_plaza:
+					has_prev = false
+					continue
 				# Local travel direction from the neighbouring points.
 				var ahead : Vector3 = road_points[base + min(i + 1, road_steps - 1)]
 				var behind : Vector3 = road_points[base + max(i - 1, 0)]
 				var travel := (ahead - behind)
 				travel = (travel - up * travel.dot(up))   # project onto the surface
 				if travel.length() < 1e-4:
+					has_prev = false
 					continue
 				travel = travel.normalized()
 				var nrm := up.cross(travel).normalized()   # width direction, on the surface
-				var center := cp + up * 1.5                # sit just above the ground
+				# Sit just above the carved road bed (cp is the bed, ~6 m below grade).
+				# 5.0 put the ribbon near the TOP of the cut so it floated ~5 m over the
+				# bed; 2.0 lays it on the bed so the road reads as sitting in its cut.
+				var center := cp + up * 2.0
 				var lft := center + nrm * road_half
 				var rgt := center - nrm * road_half
-				if i > 0:
+				if has_prev:
 					st.set_normal(up); st.add_vertex(prev_l)
 					st.set_normal(up); st.add_vertex(prev_r)
 					st.set_normal(up); st.add_vertex(lft)
@@ -659,6 +946,7 @@ func _build_settlements() -> void:
 					any_road = true
 				prev_l = lft
 				prev_r = rgt
+				has_prev = true
 		if any_road:
 			var rmesh := st.commit()
 			var rmi := MeshInstance3D.new()
@@ -671,8 +959,383 @@ func _build_settlements() -> void:
 			rmat.cull_mode = BaseMaterial3D.CULL_DISABLED
 			rmi.material_override = rmat
 			root.add_child(rmi)
+			_attach_trimesh_collider(rmi)
+
+	# Power lines: poles + slung wires beside every highway, linking the towns —
+	# the "electricity connecting the areas" of the Rust-on-a-planet feel.
+	_build_power_lines(root, road_points, road_steps)
 
 	planet.add_child(root)
+
+
+# Rivers/streams — water ribbons laid in the channels the global erosion field
+# carved (see rust/src/erosion.rs). The native side traces each course downhill
+# from a highland source to the sea and returns floor points already at the exact
+# terrain surface, plus a per-point width factor (flow) so rivers widen downstream.
+# We lay a translucent ribbon along each, banking with the ground like the roads.
+func _build_rivers() -> void:
+	if not ClassDB.class_exists("NativeTerrain"):
+		return
+	var nt : Object = ClassDB.instantiate("NativeTerrain")
+	var data : Dictionary = nt.call("river_data", world_seed, planet_radius, sea_level_offset)
+	var points : PackedVector3Array = data.get("points", PackedVector3Array())
+	var lengths : PackedInt32Array = data.get("lengths", PackedInt32Array())
+	var widths : PackedFloat32Array = data.get("widths", PackedFloat32Array())
+	if points.size() < 2 or lengths.is_empty():
+		return
+
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var any := false
+	var base := 0
+	for li in lengths.size():
+		var count : int = lengths[li]
+		if count >= 2:
+			var prev_l := Vector3.ZERO
+			var prev_r := Vector3.ZERO
+			var has_prev := false
+			for i in count:
+				var cp := points[base + i]
+				var up := cp.normalized()
+				# Travel direction along the course, projected onto the surface.
+				var ahead : Vector3 = points[base + min(i + 1, count - 1)]
+				var behind : Vector3 = points[base + max(i - 1, 0)]
+				var travel := ahead - behind
+				travel = travel - up * travel.dot(up)
+				if travel.length() < 1e-4:
+					has_prev = false
+					continue
+				travel = travel.normalized()
+				var nrm := up.cross(travel).normalized()
+				# Widen downstream with flow; sit just above the channel floor.
+				var half : float = lerp(4.0, 24.0, widths[base + i])
+				var center := cp + up * 2.0
+				var lft := center + nrm * half
+				var rgt := center - nrm * half
+				if has_prev:
+					st.set_normal(up); st.add_vertex(prev_l)
+					st.set_normal(up); st.add_vertex(prev_r)
+					st.set_normal(up); st.add_vertex(lft)
+					st.set_normal(up); st.add_vertex(prev_r)
+					st.set_normal(up); st.add_vertex(rgt)
+					st.set_normal(up); st.add_vertex(lft)
+					any = true
+				prev_l = lft
+				prev_r = rgt
+				has_prev = true
+		base += count
+
+	# Lakes — flat water discs where rivers pooled in inland basins. Added to the
+	# same water mesh/material as the rivers. Each centre is already at the lake's
+	# water surface; the rim is projected back onto the sphere for curvature.
+	var lakes : PackedVector3Array = data.get("lakes", PackedVector3Array())
+	var lake_radii : PackedFloat32Array = data.get("lake_radii", PackedFloat32Array())
+	for li in lakes.size():
+		var c := lakes[li]
+		var rad : float = lake_radii[li]
+		var surf_r := c.length()
+		if surf_r < 1.0:
+			continue
+		var up := c.normalized()
+		var t := up.cross(Vector3.RIGHT)
+		if t.length() < 0.01:
+			t = up.cross(Vector3.FORWARD)
+		t = t.normalized()
+		var bt := up.cross(t).normalized()
+		var segs := 28
+		var hub := c + up * 0.4
+		for s in segs:
+			var a0 := TAU * float(s) / float(segs)
+			var a1 := TAU * float(s + 1) / float(segs)
+			var p0 := (c + (t * cos(a0) + bt * sin(a0)) * rad).normalized() * surf_r + up * 0.4
+			var p1 := (c + (t * cos(a1) + bt * sin(a1)) * rad).normalized() * surf_r + up * 0.4
+			st.set_normal(up); st.add_vertex(hub)
+			st.set_normal(up); st.add_vertex(p1)
+			st.set_normal(up); st.add_vertex(p0)
+		any = true
+
+	if not any:
+		return
+	var rmesh := st.commit()
+	var rmi := MeshInstance3D.new()
+	rmi.name = "RiversAndLakes"
+	rmi.mesh = rmesh
+	var rmat := StandardMaterial3D.new()
+	rmat.albedo_color = Color(0.17, 0.40, 0.60, 0.74)
+	rmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	rmat.roughness = 0.12
+	rmat.metallic = 0.0
+	rmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	rmi.material_override = rmat
+	planet.add_child(rmi)
+
+
+# Region landmarks — a distinct placeholder monument at each continent-cluster
+# centre, so different regions read apart from orbit and on foot. The native side
+# returns one anchor per region (on the terrain surface, local frame); the kind of
+# monument cycles by region index: obelisk, monolith ring, stepped pyramid.
+func _build_landmarks() -> void:
+	if not ClassDB.class_exists("NativeTerrain"):
+		return
+	var nt : Object = ClassDB.instantiate("NativeTerrain")
+	var anchors : PackedVector3Array = nt.call("region_data", world_seed, planet_radius)
+	if anchors.is_empty():
+		return
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for ri in anchors.size():
+		var base := anchors[ri]
+		if base.length() < 1.0:
+			continue
+		var up := base.normalized()
+		var tangent := up.cross(Vector3.RIGHT)
+		if tangent.length() < 0.01:
+			tangent = up.cross(Vector3.FORWARD)
+		tangent = tangent.normalized()
+		var bitan := up.cross(tangent).normalized()
+		var col := Color(0.50, 0.48, 0.45).lerp(Color(0.40, 0.36, 0.34), float(ri % 3) / 2.0)
+		match ri % 3:
+			0:
+				# Obelisk: a tall tapered spire (wide base box + a thin tall box).
+				_add_landmark_box(st, base, up, tangent, bitan, 14.0, 8.0, 14.0, col)
+				_add_landmark_box(st, base + up * 16.0, up, tangent, bitan, 7.0, 60.0, 7.0, col)
+			1:
+				# Monolith ring: several tall standing stones in a circle.
+				var stones := 7
+				for s in stones:
+					var a := TAU * float(s) / float(stones)
+					var off := (tangent * cos(a) + bitan * sin(a)) * 44.0
+					_add_landmark_box(st, base + off, up, tangent, bitan, 5.0, 26.0, 9.0, col)
+			_:
+				# Stepped pyramid: stacked shrinking boxes.
+				var tiers := 4
+				for ti in tiers:
+					var half : float = lerp(34.0, 8.0, float(ti) / float(tiers - 1))
+					var y := float(ti) * 16.0
+					_add_landmark_box(st, base + up * y, up, tangent, bitan, half, 8.0, half, col)
+	var mesh := st.commit()
+	if mesh == null:
+		return
+	var mat := StandardMaterial3D.new()
+	mat.vertex_color_use_as_albedo = true
+	mat.roughness = 0.9
+	mat.metallic = 0.0
+	var mi := MeshInstance3D.new()
+	mi.name = "RegionLandmarks"
+	mi.mesh = mesh
+	mi.material_override = mat
+	planet.add_child(mi)
+	_attach_trimesh_collider(mi)
+
+
+# Add one axis-aligned-in-the-tangent-frame box to a landmark mesh. `center` is the
+# box's BASE point (on the ground); the box rises `2*hy` along `up`, spanning ±hx
+# along `tangent` and ±hz along `bitan`. Vertex-coloured `col`.
+func _add_landmark_box(st: SurfaceTool, center: Vector3, up: Vector3,
+		tangent: Vector3, bitan: Vector3, hx: float, hy: float, hz: float, col: Color) -> void:
+	var c := center + up * hy   # box centre (base sits on the ground)
+	var x := tangent * hx
+	var y := up * hy
+	var z := bitan * hz
+	var p := [
+		c - x - y - z, c + x - y - z, c + x - y + z, c - x - y + z,
+		c - x + y - z, c + x + y - z, c + x + y + z, c - x + y + z,
+	]
+	var faces := [
+		[0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6],
+		[3, 0, 4], [3, 4, 7], [4, 5, 6], [4, 6, 7], [3, 2, 1], [3, 1, 0],
+	]
+	for f in faces:
+		var a : Vector3 = p[f[0]]
+		var b : Vector3 = p[f[1]]
+		var d : Vector3 = p[f[2]]
+		var nn := (b - a).cross(d - a).normalized()
+		st.set_color(col); st.set_normal(nn); st.add_vertex(a)
+		st.set_color(col); st.set_normal(nn); st.add_vertex(b)
+		st.set_color(col); st.set_normal(nn); st.add_vertex(d)
+
+
+# Emit one street ribbon quad onto a city pad, clipped to the paved disc. `off` is
+# the line's offset along one axis; the ribbon spans ±half_len along the other,
+# is 2·half_w wide, and is lifted just above the pavement. `along_bitan` picks
+# which axis the street runs along. `pad_point` maps (tangent, bitan, lift) → a
+# point on the flat pad sphere (the closure built per pad in _build_settlements).
+func _emit_street_quad(st: SurfaceTool, pad_point: Callable, off: float,
+		half_w: float, half_len: float, along_bitan: bool, up: Vector3) -> void:
+	# Just above the pavement so the grid reads as a road surface without floating
+	# (3.2 floated off the near-flat pad now that the pad barely undulates).
+	var lift := 1.6
+	var a : Vector3
+	var b : Vector3
+	var c : Vector3
+	var d : Vector3
+	if along_bitan:
+		# Runs along bitan (oz); width in tangent (ox) around `off`.
+		a = pad_point.call(off - half_w, -half_len, lift)
+		b = pad_point.call(off + half_w, -half_len, lift)
+		c = pad_point.call(off + half_w,  half_len, lift)
+		d = pad_point.call(off - half_w,  half_len, lift)
+	else:
+		# Runs along tangent (ox); width in bitan (oz) around `off`.
+		a = pad_point.call(-half_len, off - half_w, lift)
+		b = pad_point.call( half_len, off - half_w, lift)
+		c = pad_point.call( half_len, off + half_w, lift)
+		d = pad_point.call(-half_len, off + half_w, lift)
+	st.set_normal(up); st.add_vertex(a)
+	st.set_normal(up); st.add_vertex(b)
+	st.set_normal(up); st.add_vertex(c)
+	st.set_normal(up); st.add_vertex(a)
+	st.set_normal(up); st.add_vertex(c)
+	st.set_normal(up); st.add_vertex(d)
+
+
+# Power lines along the highways: a pole every few road samples (offset to the
+# verge), a cross-arm at the top, and wires slung pole-to-pole with a little sag.
+# Connects the settlements visually — the electricity grid of a Rust-style world.
+func _build_power_lines(parent: Node3D, road_points: PackedVector3Array, road_steps: int) -> void:
+	if road_points.size() < 2 or road_steps < 2:
+		return
+	var pole_st := SurfaceTool.new()
+	pole_st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var wire_st := SurfaceTool.new()
+	wire_st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var pole_col := Color(0.20, 0.16, 0.12)
+	var wire_col := Color(0.04, 0.04, 0.05)
+	var num_roads : int = int(road_points.size() / float(road_steps))
+	const POLE_SPACING := 8        # road samples between poles
+	const POLE_HEIGHT := 16.0
+	const POLE_SIDE := 24.0        # offset from the road centreline to the verge
+	var any := false
+	for r in num_roads:
+		var base : int = r * road_steps
+		var prev_top := Vector3.ZERO
+		var has_prev := false
+		var i := 0
+		while i < road_steps:
+			var cp := road_points[base + i]
+			var up := cp.normalized()
+			var ahead : Vector3 = road_points[base + min(i + 1, road_steps - 1)]
+			var behind : Vector3 = road_points[base + max(i - 1, 0)]
+			var travel := ahead - behind
+			travel = travel - up * travel.dot(up)
+			if travel.length() < 1e-4:
+				i += POLE_SPACING
+				continue
+			travel = travel.normalized()
+			var side := up.cross(travel).normalized()
+			var base_pt := cp + side * POLE_SIDE + up * 1.0
+			var top := base_pt + up * POLE_HEIGHT
+			_add_segment_box(pole_st, base_pt, top, 0.6, side, pole_col)             # pole
+			_add_segment_box(pole_st, top - side * 3.0, top + side * 3.0, 0.4, up, pole_col)  # cross-arm
+			if has_prev:
+				var mid := (prev_top + top) * 0.5 - up * 2.5   # catenary sag
+				_add_segment_box(wire_st, prev_top, mid, 0.16, up, wire_col)
+				_add_segment_box(wire_st, mid, top, 0.16, up, wire_col)
+				any = true
+			prev_top = top
+			has_prev = true
+			i += POLE_SPACING
+	var pmesh := pole_st.commit()
+	if pmesh != null and pmesh.get_surface_count() > 0:
+		var pmat := StandardMaterial3D.new()
+		pmat.vertex_color_use_as_albedo = true
+		pmat.roughness = 0.9
+		var pmi := MeshInstance3D.new()
+		pmi.name = "PowerPoles"
+		pmi.mesh = pmesh
+		pmi.material_override = pmat
+		parent.add_child(pmi)
+	if any:
+		var wmesh := wire_st.commit()
+		var wmat := StandardMaterial3D.new()
+		wmat.vertex_color_use_as_albedo = true
+		wmat.roughness = 0.5
+		var wmi := MeshInstance3D.new()
+		wmi.name = "PowerWires"
+		wmi.mesh = wmesh
+		wmi.material_override = wmat
+		parent.add_child(wmi)
+
+
+# Build a thin box (square cross-section, half-extent `half`) from `a` to `b` into a
+# SurfaceTool — used for power poles, cross-arms and wires. `up_hint` disambiguates
+# the cross-section orientation for near-vertical / near-horizontal segments.
+func _add_segment_box(st: SurfaceTool, a: Vector3, b: Vector3, half: float, up_hint: Vector3, col: Color) -> void:
+	var axis := b - a
+	var ln := axis.length()
+	if ln < 1e-4:
+		return
+	var dir := axis / ln
+	var u := dir.cross(up_hint)
+	if u.length() < 1e-4:
+		u = dir.cross(Vector3.RIGHT)
+	u = u.normalized() * half
+	var v := dir.cross(u).normalized() * half
+	var p := [a - u - v, a + u - v, a + u + v, a - u + v, b - u - v, b + u - v, b + u + v, b - u + v]
+	var faces := [
+		[0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6],
+		[3, 0, 4], [3, 4, 7], [0, 3, 2], [0, 2, 1], [4, 5, 6], [4, 6, 7],
+	]
+	for f in faces:
+		var p0 : Vector3 = p[f[0]]
+		var p1 : Vector3 = p[f[1]]
+		var p2 : Vector3 = p[f[2]]
+		var nn := (p1 - p0).cross(p2 - p0).normalized()
+		st.set_color(col); st.set_normal(nn); st.add_vertex(p0)
+		st.set_color(col); st.set_normal(nn); st.add_vertex(p1)
+		st.set_color(col); st.set_normal(nn); st.add_vertex(p2)
+
+
+# Attach a static trimesh collider (physics layer 1) to a built man-made mesh so
+# the walk-mode player can stand on / bump into it. These meshes are static and
+# low-poly (one per planet), so a single global body each is fine — Godot's
+# broadphase culls them by distance, so there's no need to LOD or chunk them.
+func _attach_trimesh_collider(mi: MeshInstance3D) -> void:
+	if mi.mesh == null:
+		return
+	var shape := mi.mesh.create_trimesh_shape()
+	if shape == null:
+		return
+	var body := StaticBody3D.new()
+	body.collision_layer = 1
+	body.collision_mask = 0
+	var cs := CollisionShape3D.new()
+	cs.shape = shape
+	body.add_child(cs)
+	mi.add_child(body)
+
+
+# True if `p` is within `half` of any segment in the parallel (a[i], b[i]) lists.
+# Used to keep city buildings off the avenue an incoming highway takes into town.
+func _near_segment(p: Vector3, sa: PackedVector3Array, sb: PackedVector3Array, half: float) -> bool:
+	var half2 := half * half
+	for i in sa.size():
+		var a := sa[i]
+		var ab := sb[i] - a
+		var denom := ab.length_squared()
+		var t := 0.0 if denom < 1e-6 else clampf((p - a).dot(ab) / denom, 0.0, 1.0)
+		if p.distance_squared_to(a + ab * t) <= half2:
+			return true
+	return false
+
+
+# Per-building colour by district + height: cool glass/steel for tall core towers,
+# warm brick/stucco for residential low-rise, muted tan/grey (the odd rusty shed) for
+# industrial — with per-building variation so a block never looks tiled.
+func _building_color(hy: float, zt: float, industrial: bool, rng: RandomNumberGenerator) -> Color:
+	if industrial:
+		var m := rng.randf_range(0.42, 0.60)
+		if rng.randf() < 0.18:
+			return Color(m * 1.15, m * 0.78, m * 0.62)   # rusty / weathered shed
+		return Color(m * 1.04, m * 1.02, m * 0.96)        # pale corrugated grey
+	var tower_t : float = clampf((hy - 45.0) / 70.0, 0.0, 1.0)
+	if zt < 0.34 and rng.randf() < (0.35 + tower_t * 0.5):
+		# Glass/steel tower — cool, slightly blue, brighter the taller it is.
+		var b : float = rng.randf_range(0.52, 0.74) + tower_t * 0.1
+		return Color(b * rng.randf_range(0.82, 0.92), b * rng.randf_range(0.92, 1.0), b * rng.randf_range(1.0, 1.14))
+	# Warm residential brick / stucco.
+	var g := rng.randf_range(0.36, 0.64)
+	return Color(g * rng.randf_range(1.0, 1.14), g * rng.randf_range(0.9, 1.02), g * rng.randf_range(0.78, 0.92))
 
 
 # Number of placed settlements (0 if none / native extension absent).
@@ -773,6 +1436,10 @@ func _update_transforms() -> void:
 	water_mat.set_shader_parameter("sun_direction", sun_to_planet)
 	atmosphere_mat.set_shader_parameter("planet_center", planet_system.global_position)
 	water_mat.set_shader_parameter("planet_center", planet_system.global_position)
+	# Terrain aerial-perspective haze needs the same world-space sun + planet centre.
+	if terrain_mat:
+		terrain_mat.set_shader_parameter("sun_direction", sun_to_planet)
+		terrain_mat.set_shader_parameter("planet_center", planet_system.global_position)
 	if cloud_mat:
 		cloud_mat.set_shader_parameter("sun_direction", sun_to_planet)
 		cloud_mat.set_shader_parameter("planet_center", planet_system.global_position)

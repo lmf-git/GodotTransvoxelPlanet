@@ -28,8 +28,15 @@ var scatter_material : Material    # shared rock material
 var foliage_meshes   : Array       # shared per-biome plant meshes (empty = no foliage, e.g. moon)
 var foliage_material : Material    # shared foliage material
 var scatter_lod_max  : int   = 1
+# Chunks coarser than this LOD skip shadow casting — they're beyond the
+# directional shadow's max distance, so drawing them into the shadow-map
+# splits was pure cost. Set by the planet (see planet.gd shadow_lod_max).
+var shadow_lod_max   : int   = 99
 var planet_radius_for_scatter : float = 0.0
 var sea_level_offset_for_scatter : float = 0.0
+# Camera distance beyond which foliage MultiMeshes fade/cull (ground cover is
+# sub-pixel by then) — a draw-call + overdraw optimisation. Rocks stay unlimited.
+const FOLIAGE_VIS_END : float = 700.0
 
 # Transvoxel transition mask. Per the `transvoxel` crate's convention this
 # marks faces whose neighbour is FINER (higher-res) — the side on which THIS
@@ -46,6 +53,8 @@ var _mesh_instance : MeshInstance3D
 var _static_body   : StaticBody3D
 var _coll_shape    : CollisionShape3D
 var _scatter_mmi   : MultiMeshInstance3D
+var _scatter_body  : StaticBody3D       # rock collision, only on the closest LOD
+var _scatter_coll  : CollisionShape3D
 var _foliage_mmis  : Array = []   # one MultiMeshInstance3D per foliage type (lazy)
 var _pending       : bool = false   # a native mesh job is in flight
 var _alive         : bool = true
@@ -91,9 +100,19 @@ func request_build() -> void:
 		return
 	_pending = true
 	_last_built_mask = transition_mask
+	# Scatter is generated on the Rust worker (off the main thread) for near chunks
+	# only — lod <= scatter_lod_max. Foliage is included unless this body has none
+	# (airless). The worker returns the instance buffers in the result dict.
+	var want_scatter := scatter_mesh != null and lod <= scatter_lod_max
+	var want_foliage := want_scatter and not foliage_meshes.is_empty()
+	# Closest LOD also gets a worker-built rock collision soup (so the walk-mode
+	# player can't pass through rocks) — no per-vertex transform on the main thread.
+	var want_scatter_collision := want_scatter and lod == 0
 	native.call("submit_chunk", get_instance_id(), world_seed,
 		float(planet_radius_for_scatter), origin, size, resolution,
-		transition_mask, planet_center, build_collision)
+		transition_mask, planet_center, build_collision,
+		want_scatter, want_foliage, want_scatter_collision,
+		float(sea_level_offset_for_scatter))
 
 
 # Called by the planet octree when this chunk's native mesh is ready.
@@ -148,6 +167,11 @@ func _apply_mesh(result: Dictionary) -> void:
 	arr[Mesh.ARRAY_VERTEX] = positions
 	arr[Mesh.ARRAY_NORMAL] = normals
 	arr[Mesh.ARRAY_INDEX]  = indices
+	# Per-vertex urban factor (vertex-colour R = 1 − urban), present only on chunks that
+	# touch a settlement. The terrain shader reads it to paint packed urban ground.
+	var colors : PackedColorArray = result.get("colors", PackedColorArray())
+	if colors.size() == positions.size():
+		arr[Mesh.ARRAY_COLOR] = colors
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
 	if material:
 		mesh.surface_set_material(0, material)
@@ -169,13 +193,13 @@ func _apply_mesh(result: Dictionary) -> void:
 	else:
 		_remove_collision()
 
-	_update_scatter(positions, normals, indices)
+	_update_scatter(result)
 
 
-func _update_scatter(positions: PackedVector3Array, normals: PackedVector3Array,
-		indices: PackedInt32Array) -> void:
-	# Scatter is only for the near (fine) chunks. Beyond scatter_lod_max, hide any
-	# leftover instances and bail.
+func _update_scatter(result: Dictionary) -> void:
+	# Scatter transforms are now computed on the Rust WORKER (see scatter.rs) and
+	# arrive in the result dict — no per-triangle noise work on the main thread here.
+	# Beyond scatter_lod_max, hide any leftover instances and bail.
 	if lod > scatter_lod_max:
 		if _scatter_mmi:
 			_scatter_mmi.visible = false
@@ -183,35 +207,36 @@ func _update_scatter(positions: PackedVector3Array, normals: PackedVector3Array,
 			if m:
 				m.visible = false
 		return
-	var coords_seed := hash([int(origin.x), int(origin.y), int(origin.z), lod])
 
 	# ── Rocks ──────────────────────────────────────────────────────────────
 	if scatter_mesh != null:
-		var rx := TerrainScatter.build_rock_transforms(
-			positions, normals, indices,
-			planet_center, planet_radius_for_scatter,
-			sea_level_offset_for_scatter, coords_seed)
+		var rx : PackedFloat32Array = result.get("rock_xforms", PackedFloat32Array())
 		_scatter_mmi = _apply_stream(_scatter_mmi, scatter_mesh, scatter_material, rx)
+		# Rocks are solid obstacles for the walk-mode player. The worker already
+		# transformed the rock proto into a collision soup for the closest LOD (lod 0,
+		# where the player stands) — just hand it to the shape, no main-thread work.
+		var rock_soup : PackedVector3Array = result.get("rock_collision_faces", PackedVector3Array())
+		_update_scatter_collision(rock_soup)
 
-	# ── Foliage — one MultiMesh per biome plant type. Decorrelated seed so it
-	#    doesn't land on the same triangles as the rocks.
+	# ── Foliage — one MultiMesh per biome plant type ("fol_0".."fol_N"). ─────
 	if not foliage_meshes.is_empty():
-		var streams := TerrainScatter.build_foliage_streams(
-			positions, normals, indices,
-			planet_center, planet_radius_for_scatter,
-			sea_level_offset_for_scatter, coords_seed ^ 0x5BD1E5)
 		if _foliage_mmis.size() != foliage_meshes.size():
 			_foliage_mmis.resize(foliage_meshes.size())
 		for t in foliage_meshes.size():
+			var stream : PackedFloat32Array = result.get("fol_%d" % t, PackedFloat32Array())
+			# Foliage gets a camera visibility range so the renderer culls/fades it
+			# past FOLIAGE_VIS_END (ground cover is sub-pixel by then) — cuts draw
+			# calls + overdraw, the densest scatter. Rocks pass 0 = unlimited.
 			_foliage_mmis[t] = _apply_stream(
-				_foliage_mmis[t], foliage_meshes[t], foliage_material, streams[t])
+				_foliage_mmis[t], foliage_meshes[t], foliage_material, stream, FOLIAGE_VIS_END)
 
 
 # Push a 12-float-per-instance transform buffer into a MultiMeshInstance (created
 # lazily), or hide it if empty. Returns the (possibly newly-created) instance.
 # The buffer is already in MultiMesh TRANSFORM_3D order, so it's one assignment.
+# `vis_end` > 0 sets a camera visibility range (renderer culls/fades beyond it).
 func _apply_stream(mmi: MultiMeshInstance3D, mesh: Mesh, mat: Material,
-		xforms: PackedFloat32Array) -> MultiMeshInstance3D:
+		xforms: PackedFloat32Array, vis_end: float = 0.0) -> MultiMeshInstance3D:
 	# 12 floats per instance (3×4 transform), so the length is a multiple of 12.
 	var count : int = int(xforms.size() / 12.0)
 	if count == 0:
@@ -226,6 +251,10 @@ func _apply_stream(mmi: MultiMeshInstance3D, mesh: Mesh, mat: Material,
 		mmi.multimesh = mm
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 		mmi.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		if vis_end > 0.0:
+			mmi.visibility_range_end = vis_end
+			mmi.visibility_range_end_margin = vis_end * 0.2
+			mmi.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
 		if mat:
 			mmi.material_override = mat
 		add_child(mmi)
@@ -235,10 +264,34 @@ func _apply_stream(mmi: MultiMeshInstance3D, mesh: Mesh, mat: Material,
 	return mmi
 
 
+# Install (or clear) the static trimesh collider for the rock instances, so the
+# walk-mode player can't pass through them. `faces` is the worker-built rock collision
+# soup (de-indexed triangle soup, already transformed per instance — see
+# rust/src/scatter.rs::rock_collision_soup); pass empty to clear. Only the closest-LOD
+# chunks request it, so distant scatter stays collider-free.
+func _update_scatter_collision(faces: PackedVector3Array) -> void:
+	if faces.is_empty() or scatter_mesh == null:
+		if _scatter_coll:
+			_scatter_coll.shape = null
+		return
+	if _scatter_body == null:
+		_scatter_body = StaticBody3D.new()
+		_scatter_body.collision_layer = 1
+		_scatter_body.collision_mask = 0
+		_scatter_coll = CollisionShape3D.new()
+		_scatter_body.add_child(_scatter_coll)
+		add_child(_scatter_body)
+	var shape := ConcavePolygonShape3D.new()
+	shape.set_faces(faces)
+	_scatter_coll.shape = shape
+
+
 func _ensure_mesh_instance() -> void:
 	if _mesh_instance == null:
 		_mesh_instance = MeshInstance3D.new()
-		_mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		_mesh_instance.cast_shadow = (
+			GeometryInstance3D.SHADOW_CASTING_SETTING_ON if lod <= shadow_lod_max
+			else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF)
 		_mesh_instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		add_child(_mesh_instance)
 
@@ -260,6 +313,19 @@ func _remove_collision() -> void:
 
 func has_mesh() -> bool:
 	return _has_mesh
+
+
+# Show/hide the chunk AND match its physics colliders, so a superseded chunk that's
+# been hidden during an LOD swap doesn't keep colliding (you'd bump invisible coarse
+# terrain while walking). Cheap flag toggles; only called on swap transitions.
+func set_chunk_visible(v: bool) -> void:
+	if visible == v:
+		return
+	visible = v
+	if _coll_shape:
+		_coll_shape.disabled = not v
+	if _scatter_coll:
+		_scatter_coll.disabled = not v
 
 
 func release() -> void:

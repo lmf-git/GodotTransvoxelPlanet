@@ -107,13 +107,18 @@ void fragment() {
 	vec3 wn = normalize(v_world_normal);
 	// Planet-LOCAL coords for biome calculations — rotation-invariant under spin.
 	vec3 rel_local = planet_basis_inv * (v_world_pos - planet_center);
+	// Planet-local normal too, so the triplanar texture below is sampled in the SAME
+	// frame as rel_local. Sampling it in WORLD space (the old bug) made the stone
+	// banding swim across every rock as the planet spun.
+	vec3 wn_local = normalize(planet_basis_inv * wn);
 	float r = length(rel_local);
 	vec3 radial = (r > 1e-6) ? rel_local / r : vec3(0.0, 1.0, 0.0);
 	float altitude = r - planet_radius;
 	float lat = abs(dot(radial, normalize(polar_axis)));   // 0 = equator, 1 = pole
 
-	// 1) Rock surface texture — banded dark/light driven by triplanar fbm.
-	float rband = triplanar_fbm(v_world_pos, wn, rock_texture_scale, 4);
+	// 1) Rock surface texture — banded dark/light driven by triplanar fbm, sampled in
+	//    planet-LOCAL space so it stays locked to the rock as the planet spins.
+	float rband = triplanar_fbm(rel_local, wn_local, rock_texture_scale, 4);
 	rband = smoothstep(0.30, 0.70, rband);
 	vec3 rock_col = mix(color_rock_dark, color_rock_light, rband);
 	rock_col = mix(color_rock_base, rock_col, 0.65);
@@ -136,7 +141,7 @@ void fragment() {
 	// Add some noise to break the horizontal seam so the blend reads as
 	// soil/moss creeping up, not a perfect line.
 	float ny = clamp((v_object_pos.y + 1.0) * 0.5, 0.0, 1.0);   // assume mesh roughly in [-1, +1]
-	float blend_noise = fbm3(v_world_pos * 0.6, 3) * 0.25;
+	float blend_noise = fbm3(rel_local * 0.6, 3) * 0.25;   // planet-local, locked to the rock
 	float base_t = smoothstep(0.0, rock_base_height, ny + blend_noise);
 	vec3 col = mix(biome_col, rock_col, base_t);
 

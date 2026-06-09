@@ -51,6 +51,21 @@ pub struct MeshData {
     /// Empty unless `want_collision` was set — only near chunks need it, and
     /// building it here keeps it off the main thread.
     pub collision_faces: Vec<f32>,
+    /// Prop scatter instance transforms (12 floats each, MultiMesh layout), filled
+    /// by the worker after meshing when the chunk asked for scatter. `rock_xforms`
+    /// is the rock pass; `foliage_xforms` is one buffer per foliage type.
+    pub rock_xforms: Vec<f32>,
+    pub foliage_xforms: Vec<Vec<f32>>,
+    /// De-indexed rock collision triangle soup (flat x,y,z per vertex), built on the
+    /// worker by transforming the shared rock proto-mesh by each rock instance — only
+    /// for the closest-LOD chunks that asked (was a per-vertex main-thread transform
+    /// loop in voxel_chunk.gd). Empty unless requested + the proto was registered.
+    pub rock_collision_faces: Vec<f32>,
+    /// Per-vertex "urban" factor (0 = wild ground, 1 = town pad), one f32 per vertex.
+    /// The terrain shader reads it (as vertex-colour R) to make the BIOME itself read
+    /// as packed/trodden urban ground under settlements — no stamped concrete disc.
+    /// 0 everywhere on chunks clear of any settlement.
+    pub urban: Vec<f32>,
 }
 
 pub fn build(
@@ -69,6 +84,20 @@ pub fn build(
     let gs2 = gs * gs;
     let base = origin.sub(V3::new(voxel, voxel, voxel));
 
+    // Per-chunk settlement broad-phase: if this whole chunk (incl. halo) is clear of
+    // every city pad / road corridor, the settlement carve is a guaranteed no-op, so
+    // we sample via the cheaper path that skips the per-voxel city/road loop. Decided
+    // once here, then applied to every voxel + every transition-cell coarse gradient.
+    let span = (gs - 1) as f32 * voxel;
+    // Expand the test region by one chunk extent so a chunk and its (at most 2:1
+    // coarser) LOD neighbour AGREE on whether the settlement carve applies. Without the
+    // margin one side could carve and the other not, splitting the LOD seam open.
+    let m = span;
+    let do_settle = density.settlements_near(
+        [base.x - m, base.y - m, base.z - m],
+        [base.x + span + m, base.y + span + m, base.z + span + m],
+    );
+
     // ── 1. Sample density grid (R+3)^3 (incl. 1-voxel halo) ─────────────────
     let mut d = vec![0.0f32; gs * gs * gs];
     for zi in 0..gs {
@@ -77,7 +106,7 @@ pub fn build(
             let yw = base.y + yi as f32 * voxel;
             for xi in 0..gs {
                 let xw = base.x + xi as f32 * voxel;
-                d[xi + yi * gs + zi * gs2] = density.sample(xw, yw, zw);
+                d[xi + yi * gs + zi * gs2] = density.sample_opts(xw, yw, zw, do_settle);
             }
         }
     }
@@ -88,6 +117,8 @@ pub fn build(
     if !has_surface(&d) {
         return MeshData {
             positions: vec![], normals: vec![], indices: vec![], collision_faces: vec![],
+            rock_xforms: vec![], foliage_xforms: vec![], rock_collision_faces: vec![],
+            urban: vec![],
         };
     }
 
@@ -193,12 +224,15 @@ pub fn build(
     if coarser_mask != 0 {
         shift_regular_boundary_vertices(&mut positions, origin, size, voxel, coarser_mask);
         build_transition_cells(&d, gs, gs2, resolution, voxel, origin, coarser_mask,
-                               &grad, cs, cs2, density, &mut positions, &mut normals, &mut indices);
+                               &grad, cs, cs2, density, do_settle, &mut positions, &mut normals, &mut indices);
     }
 
     // ── Finalise normals (stored as raw +gradient; outward = -grad) ─────────
     let mut out_pos = Vec::with_capacity(positions.len() * 3);
     let mut out_nrm = Vec::with_capacity(normals.len() * 3);
+    // Per-vertex urban factor (settlement proximity) — only meaningful near a town, so
+    // 0 for chunks the broad-phase cleared. Reuses the radial computed for the normal.
+    let mut urban = vec![0.0f32; positions.len()];
     for i in 0..positions.len() {
         let p = positions[i];
         let mut radial = p.sub(pc);
@@ -217,6 +251,9 @@ pub fn build(
         }
         out_pos.push(p.x); out_pos.push(p.y); out_pos.push(p.z);
         out_nrm.push(n.x); out_nrm.push(n.y); out_nrm.push(n.z);
+        if do_settle {
+            urban[i] = density.settlement_factor(radial.x, radial.y, radial.z);
+        }
     }
 
     // De-index into a triangle soup for collision, only when asked (near chunks).
@@ -233,7 +270,16 @@ pub fn build(
         Vec::new()
     };
 
-    MeshData { positions: out_pos, normals: out_nrm, indices, collision_faces }
+    MeshData {
+        positions: out_pos,
+        normals: out_nrm,
+        indices,
+        collision_faces,
+        rock_xforms: vec![],
+        foliage_xforms: vec![],
+        rock_collision_faces: vec![],
+        urban,
+    }
 }
 
 fn has_surface(d: &[f32]) -> bool {
@@ -325,31 +371,34 @@ fn corner_gradient(axis: usize, u_axis: usize, v_axis: usize, fixed_chunk: usize
 
 // Raw +gradient at a world point via central differences at spacing h (the
 // coarse neighbour's voxel), matching the coarse mesh's normal at the seam.
-fn coarse_resolution_gradient(p: V3, density: &PlanetDensity, h: f32) -> V3 {
-    let dx = density.sample(p.x + h, p.y, p.z) - density.sample(p.x - h, p.y, p.z);
-    let dy = density.sample(p.x, p.y + h, p.z) - density.sample(p.x, p.y - h, p.z);
-    let dz = density.sample(p.x, p.y, p.z + h) - density.sample(p.x, p.y, p.z - h);
+// `do_settle` mirrors the regular grid's settlement gate so the seam samples the
+// SAME field as the chunk interior (no mismatch on a settlement-free chunk).
+fn coarse_resolution_gradient(p: V3, density: &PlanetDensity, h: f32, do_settle: bool) -> V3 {
+    let s = |x: f32, y: f32, z: f32| density.sample_opts(x, y, z, do_settle);
+    let dx = s(p.x + h, p.y, p.z) - s(p.x - h, p.y, p.z);
+    let dy = s(p.x, p.y + h, p.z) - s(p.x, p.y - h, p.z);
+    let dz = s(p.x, p.y, p.z + h) - s(p.x, p.y, p.z - h);
     V3::new(dx, dy, dz)
 }
 
 fn build_transition_cells(
     d: &[f32], gs: usize, gs2: usize, resolution: usize, voxel: f32, origin: V3,
     coarser_mask: i32, grad: &[V3], cs: usize, cs2: usize, density: &PlanetDensity,
-    positions: &mut Vec<V3>, normals: &mut Vec<V3>, indices: &mut Vec<i32>,
+    do_settle: bool, positions: &mut Vec<V3>, normals: &mut Vec<V3>, indices: &mut Vec<i32>,
 ) {
     for face_bit in 0..6 {
         if (coarser_mask & (1 << face_bit)) == 0 {
             continue;
         }
         process_transition_face(face_bit, d, gs, gs2, resolution, voxel, origin,
-                                grad, cs, cs2, density, positions, normals, indices);
+                                grad, cs, cs2, density, do_settle, positions, normals, indices);
     }
 }
 
 fn process_transition_face(
     face_bit: usize, d: &[f32], gs: usize, gs2: usize, resolution: usize, voxel: f32, origin: V3,
     grad: &[V3], cs: usize, cs2: usize, density: &PlanetDensity,
-    positions: &mut Vec<V3>, normals: &mut Vec<V3>, indices: &mut Vec<i32>,
+    do_settle: bool, positions: &mut Vec<V3>, normals: &mut Vec<V3>, indices: &mut Vec<i32>,
 ) {
     let axis = face_bit / 2;
     let side = face_bit & 1;
@@ -371,7 +420,7 @@ fn process_transition_face(
         while fv + 2 <= resolution {
             emit_transition_cell(axis, u_axis, v_axis, side, fixed_chunk, inward_off,
                                  fu, fv, d, gs, gs2, voxel, origin,
-                                 grad, cs, cs2, density, positions, normals, indices);
+                                 grad, cs, cs2, density, do_settle, positions, normals, indices);
             fv += 2;
         }
         fu += 2;
@@ -382,7 +431,7 @@ fn emit_transition_cell(
     axis: usize, u_axis: usize, v_axis: usize, side: usize, fixed_chunk: usize, inward_off: V3,
     fu: usize, fv: usize,
     d: &[f32], gs: usize, gs2: usize, voxel: f32, origin: V3,
-    grad: &[V3], cs: usize, cs2: usize, density: &PlanetDensity,
+    grad: &[V3], cs: usize, cs2: usize, density: &PlanetDensity, do_settle: bool,
     positions: &mut Vec<V3>, normals: &mut Vec<V3>, indices: &mut Vec<i32>,
 ) {
     let mut samples = [0.0f32; 13];
@@ -439,10 +488,10 @@ fn emit_transition_cell(
         }
     }
     let coarse_h = 2.0 * voxel;
-    cgrad[9] = coarse_resolution_gradient(cpos[9], density, coarse_h);
-    cgrad[10] = coarse_resolution_gradient(cpos[10], density, coarse_h);
-    cgrad[11] = coarse_resolution_gradient(cpos[11], density, coarse_h);
-    cgrad[12] = coarse_resolution_gradient(cpos[12], density, coarse_h);
+    cgrad[9] = coarse_resolution_gradient(cpos[9], density, coarse_h, do_settle);
+    cgrad[10] = coarse_resolution_gradient(cpos[10], density, coarse_h, do_settle);
+    cgrad[11] = coarse_resolution_gradient(cpos[11], density, coarse_h, do_settle);
+    cgrad[12] = coarse_resolution_gradient(cpos[12], density, coarse_h, do_settle);
 
     // Emit every vertex fresh (no reuse cache — no slot-indexing bugs).
     let mut local_verts = [0i32; 13];

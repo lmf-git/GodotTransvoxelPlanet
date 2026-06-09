@@ -49,11 +49,22 @@ uniform float detail_scale : hint_range(0.001, 0.1)  = 0.008;   // high-freq noi
 uniform float detail_strength : hint_range(0.0, 0.6) = 0.16;   // halved: 0.32 was strong enough to push base above coverage BELOW threshold, which made clouds blink in/out as the detail noise drifted
 uniform float drift_speed  : hint_range(0.0, 0.05)   = 0.004;
 
+// ── Performance LOD ──────────────────────────────────────────────────────────
+// `quality` scales the march budget: step size grows and the step cap shrinks
+// together as it drops (1.0 = full quality, ~0.45 = half-cost). Driven at
+// runtime by world.gd's auto-quality controller, which lowers it when the
+// frame rate sags and raises it back when there's headroom — so the deck keeps
+// its look when the GPU can afford it and degrades gracefully when it can't.
+uniform float quality : hint_range(0.3, 1.0) = 1.0;
+// Beyond this view distance the 3rd (longest) self-shadow probe is dropped —
+// at horizon/orbit ranges its contribution is sub-pixel but its cost isn't.
+uniform float shadow_detail_dist = 6000.0;
+
 // Upper bound on raymarch samples. Kept constant so the loop compiles to a
 // fixed count — dynamic loop *bounds* can trip Metal's SPIR-V→MSL converter, so
 // instead we keep this bound fixed and `break` early (a dynamic break is fine).
 // Proximity LOD picks the actual sample count per-pixel from the view distance.
-const int MAX_MARCH_STEPS = 20;
+const int MAX_MARCH_STEPS = 36;   // was 20 — too few samples through the deck left dither grain ("noisy" clouds)
 
 varying vec3 v_world;
 
@@ -111,10 +122,20 @@ float cloud_density(vec3 wp) {
 	// away just above/below you whenever you were inside the deck.
 	float vfall = clamp(1.0 - abs(r - mid) / half_span, 0.0, 1.0);
 	vfall = smoothstep(0.0, 0.25, vfall);
+	if (vfall <= 0.0) {
+		return 0.0;   // outside the deck's vertical band — skip both fbms
+	}
 	// Drift in local frame — clouds move slowly relative to the ground
 	// (real-cloud timescale) instead of being yanked around by spin.
 	vec3 sp = rel_local * cloud_scale + vec3(TIME * drift_speed, 0.0, TIME * drift_speed * 0.7);
 	float base = fbm(sp);
+	// EXACT empty-space early-out: the detail term is SUBTRACTED (n = base −
+	// detail_strength·(1−detail) ≤ base), so when base is already at/below the
+	// coverage threshold the smoothstep below is guaranteed 0 — skip the second
+	// (detail) fbm entirely. Clear-sky samples cost half; the result is identical.
+	if (base <= coverage) {
+		return 0.0;
+	}
 	// Layer in a higher-frequency detail noise that EATS INTO the base shape
 	// (subtracted, not added) — the "billow" technique: it carves ragged
 	// holes/tendrils out of solid masses so silhouettes break up instead of
@@ -195,9 +216,16 @@ void fragment() {
 	// dithers the sample positions so the ±1 change in step COUNT (as the segment
 	// length changes while you move) breaks into fine noise rather than a coherent
 	// whole-screen pop — the "clouds regenerate as I move" artifact.
-	float dt = max((cloud_outer - cloud_inner) / 14.0, seg / float(MAX_MARCH_STEPS));
+	// `quality` (the runtime LOD) coarsens the step and shrinks the cap together:
+	// at 0.5 the march costs half. The per-pixel jitter below dithers the coarser
+	// sampling into noise rather than banding.
+	float q = clamp(quality, 0.3, 1.0);
+	float dt = max((cloud_outer - cloud_inner) / (26.0 * q), seg / (float(MAX_MARCH_STEPS) * q));
 	int steps = int(clamp(ceil(seg / dt), 1.0, float(MAX_MARCH_STEPS)));
-	float jitter = (hash3(vec3(FRAGCOORD.xy, 11.7)) - 0.5) * 0.55;   // gentler dither → less grain
+	// Finer fixed step (deck/26) + more steps (36) integrate the volume smoothly;
+	// with that many samples the dither jitter can be gentle (0.3) so it kills
+	// residual banding without adding the grain that read as "noisy" clouds.
+	float jitter = (hash3(vec3(FRAGCOORD.xy, 11.7)) - 0.5) * 0.3;
 	float light_step = (cloud_outer - cloud_inner) / 4.0;
 
 	// Henyey-Greenstein-ish forward-scatter lobe: clouds brighten when the
@@ -217,14 +245,19 @@ void fragment() {
 		vec3 pos = ro + rd * t;
 		float dens = cloud_density(pos);
 		if (dens > 0.001) {
-			// Multi-sample self-shadow: walk 4 steps toward the sun and
+			// Multi-sample self-shadow: walk steps toward the sun and
 			// accumulate density. Single-sample was the reason clouds came out
 			// uniformly bright — the body of a cloud blocks 4× more sun than
 			// its edge, but a single sample can't tell them apart.
 			float ls = 0.0;
 			ls += cloud_density(pos + to_sun * light_step * 1.0);
 			ls += cloud_density(pos + to_sun * light_step * 2.5) * 0.7;
-			ls += cloud_density(pos + to_sun * light_step * 5.0) * 0.4;
+			// The longest probe only at close/mid range (and not on the lowest
+			// quality tier) — beyond shadow_detail_dist its shading difference is
+			// sub-pixel but it costs a full density evaluation per march step.
+			if (t < shadow_detail_dist && q > 0.55) {
+				ls += cloud_density(pos + to_sun * light_step * 5.0) * 0.4;
+			}
 			// Strong attenuation: exp(-ls * 2.5) lets thick cloud bodies
 			// drive `light` to near-zero so they read as solid grey-blue
 			// shadow against the lit edges and rim.

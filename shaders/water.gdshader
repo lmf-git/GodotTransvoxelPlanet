@@ -36,7 +36,7 @@ uniform float wave_scale_chop      : hint_range(0.001, 0.05)  = 0.014;
 uniform float wave_scale_ripple    : hint_range(0.005, 0.5)   = 0.075;
 uniform float wave_scale_close     : hint_range(0.05, 2.0)    = 0.45;   // fine ripple octave that LOD-fades in when the camera is near the surface
 uniform float wave_strength        : hint_range(0.0, 2.0)     = 0.55;
-uniform float wave_speed           : hint_range(0.0, 1.5)     = 0.45;   // bumped: 0.06 was a fraction of a feature/sec — surface looked frozen
+uniform float wave_speed           : hint_range(0.0, 1.5)     = 0.13;   // calm drift: 0.45 read as water visibly racing across the surface; 0.06 looked frozen — 0.13 is a gentle sea
 uniform float lod_near             : hint_range(1.0, 500.0)   = 30.0;   // metres: ramp-in is fully on at this distance
 uniform float lod_far              : hint_range(100.0, 8000.0)= 1800.0; // metres: detail ramp-in is off beyond this
 

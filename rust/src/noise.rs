@@ -100,6 +100,38 @@ impl Noise {
         Self { seed, freq, octaves: octaves.max(1), lacunarity, gain, fractal, bounding }
     }
 
+    /// Ridged MULTIFRACTAL (Musgrave): like ridged fBm, but each octave is multiplied
+    /// by the clamped signal of the PREVIOUS octave, so high-frequency detail
+    /// concentrates on the crests and fades out in the valleys. The result is sharp,
+    /// connected ridgelines with smooth troughs — real mountain structure, instead of
+    /// the round bumps a single ridged term gives. Returns ~[0, 1] (1 at a crest);
+    /// uses the configured freq/octaves/lacunarity/gain.
+    pub fn ridged_multi_3d(&self, x: f32, y: f32, z: f32) -> f32 {
+        const OFFSET: f32 = 1.0;
+        const WEIGHT_GAIN: f32 = 2.0; // how strongly a crest amplifies the next octave
+        let mut px = x * self.freq;
+        let mut py = y * self.freq;
+        let mut pz = z * self.freq;
+        let mut amp = 1.0_f32;
+        let mut weight = 1.0_f32;
+        let mut sum = 0.0_f32;
+        let mut norm = 0.0_f32;
+        for _ in 0..self.octaves {
+            let n = perlin3(self.seed, px, py, pz);
+            let mut signal = (OFFSET - n.abs()).max(0.0);
+            signal *= signal; // square → sharpen the ridge
+            signal *= weight; // gate by the previous octave (kills valley detail)
+            weight = (signal * WEIGHT_GAIN).clamp(0.0, 1.0);
+            sum += signal * amp;
+            norm += amp;
+            amp *= self.gain;
+            px *= self.lacunarity;
+            py *= self.lacunarity;
+            pz *= self.lacunarity;
+        }
+        if norm > 0.0 { (sum / norm).clamp(0.0, 1.0) } else { 0.0 }
+    }
+
     pub fn get_noise_3d(&self, x: f32, y: f32, z: f32) -> f32 {
         let mut px = x * self.freq;
         let mut py = y * self.freq;

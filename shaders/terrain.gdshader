@@ -34,8 +34,12 @@ uniform float lapse_rate           : hint_range(0.0, 1.0)        = 0.6;
 uniform float lapse_full_altitude  : hint_range(200.0, 3000.0)   = 1500.0; // altitude above sea where the drop saturates
 uniform float beach_altitude       : hint_range(-300.0, 100.0)   = 8.0;
 uniform float beach_fade           : hint_range(0.1, 100.0)      = 14.0;
-uniform float rock_slope_threshold : hint_range(0.0, 1.0)        = 0.30;
-uniform float rock_slope_fade      : hint_range(0.001, 0.5)      = 0.18;
+// Steep surfaces are bare ROCK. Pushed up from 0.30 (slope 1 = flat, 0 = cliff): the
+// old value only rocked near-vertical faces, so beach cliffs and canyon/mountain walls
+// (~45–65°) showed their lowland biome — sand/orange — instead of stone. 0.55/0.28
+// makes anything steeper than a gentle hill read as cliff rock.
+uniform float rock_slope_threshold : hint_range(0.0, 1.0)        = 0.55;
+uniform float rock_slope_fade      : hint_range(0.001, 0.5)      = 0.28;
 
 uniform vec3 color_grass  : source_color = vec3(0.28, 0.46, 0.18);   // temperate green
 uniform vec3 color_dirt   : source_color = vec3(0.45, 0.33, 0.20);   // arable earth
@@ -80,12 +84,46 @@ uniform float temp_macro_amp   : hint_range(0.0, 0.5)  = 0.28;
 uniform float roughness_base : hint_range(0.0, 1.0) = 0.92;
 uniform float specular_base  : hint_range(0.0, 1.0) = 0.04;
 
+// ─── Aerial perspective (atmospheric distance haze) ─────────────────────────
+// Distant ground fades toward the sky/atmosphere colour and brightens toward the
+// sun — the depth cue SpaceEngine and I-Novae (Infinity: Battlescape) lean on to
+// sell planetary scale. Faded out as the camera climbs into space (it's the path
+// through the air that hazes, not raw distance), so the globe doesn't wash out
+// from orbit. `sun_direction` / `planet_center` are world-space, set per frame.
+uniform vec3  sun_direction    = vec3(0.0, 1.0, 0.0);
+uniform vec3  haze_color       : source_color = vec3(0.52, 0.66, 0.84);
+uniform vec3  haze_sun_color   : source_color = vec3(1.0, 0.92, 0.78);
+uniform float haze_density     : hint_range(0.0, 0.0005) = 0.00008;
+uniform float haze_strength    : hint_range(0.0, 1.0)    = 0.7;
+uniform float haze_alt_falloff : hint_range(0.0, 0.01)   = 0.00033;
+
+// Procedural micro-normal (bump) strength + the view-distance band over which it
+// fades out, so surface relief reads up close without shimmering on far hills.
+uniform float bump_strength    : hint_range(0.0, 4.0)  = 0.6;
+uniform float bump_fade_near   : hint_range(0.0, 2000.0) = 120.0;
+uniform float bump_fade_far    : hint_range(0.0, 4000.0) = 900.0;
+
+// Procedurally-generated PBR ground-detail texture (a seamless grain map made from
+// noise in world.gd — no texture files). Triplanar-sampled at close range and used
+// to drive albedo grain, roughness variation AND the micro-normal, so the biome
+// ground reads as a real material surface up close rather than flat colour.
+uniform sampler2D detail_grain_tex : hint_default_white;
+uniform float detail_grain_scale : hint_range(0.001, 0.5) = 0.06;
+uniform float detail_grain_amt   : hint_range(0.0, 0.5)   = 0.18;  // albedo grain depth
+uniform float detail_rough_amt   : hint_range(0.0, 0.5)   = 0.20;  // roughness variation depth
+
 // Both varyings are in OBJECT space (the planet's local frame). That keeps
 // biome zones, latitude, and triplanar textures locked to the planet as it
 // rotates / orbits — they're properties of the place on the planet, not of
 // where the planet happens to be in the world this frame.
 varying vec3 v_obj_pos;
 varying vec3 v_obj_normal;
+// Vertex colour carries (1 − urban) in R — see rust mesh_to_dict. A chunk with no
+// colour array defaults to white (R = 1 ⇒ urban 0), so the urban tint is opt-in.
+varying vec4 v_color;
+
+// Packed/trodden urban ground colour the terrain blends toward under a settlement.
+uniform vec3 color_urban : source_color = vec3(0.34, 0.31, 0.27);
 
 
 // ─── Cheap pseudo-hash + value noise ────────────────────────────────────────
@@ -148,6 +186,7 @@ vec3 triplanar_tinted(vec3 base, vec3 pos, vec3 nrm, float scale) {
 void vertex() {
 	v_obj_pos    = VERTEX;
 	v_obj_normal = NORMAL;
+	v_color      = COLOR;
 }
 
 
@@ -222,9 +261,13 @@ void fragment() {
 	vec3 lowland = cold * cold_w + temperate * temp_w + hot * hot_w;
 
 	// Highland (high-elevation) base: alpine bare rock dominates, tinted red
-	// in hot-dry climates (Mars-like mesas) and snowy in cold ones.
+	// in hot-dry climates (Mars-like mesas) and snowy in cold ones. The redrock
+	// tint is confined to MID elevations (mesa country): above ~900 m every
+	// climate converges on bare alpine rock — high peaks were reading as sandy
+	// desert because hot-dry summits kept their redrock/desert tint all the way up.
+	float mesa_band = 1.0 - smoothstep(550.0, 950.0, altitude);
 	vec3 highland = mix(color_alpine, color_redrock,
-			smoothstep(0.55, 0.85, temperature) * smoothstep(0.35, 0.05, humidity));
+			smoothstep(0.55, 0.85, temperature) * smoothstep(0.35, 0.05, humidity) * mesa_band);
 	highland = mix(highland, color_snow, smoothstep(0.30, 0.05, temperature));
 
 	// Blend lowland ↔ highland by elevation.
@@ -237,7 +280,7 @@ void fragment() {
 
 	// Beach / sand near sea level. Suppressed at the poles (ice instead).
 	float beach_t = 1.0 - smoothstep(beach_altitude, beach_altitude + beach_fade, altitude);
-	beach_t = clamp(beach_t, 0.0, 1.0) * (1.0 - polar_t);
+	beach_t = clamp(beach_t, 0.0, 1.0) * (1.0 - polar_t) * smoothstep(0.50, 0.80, slope);  // flat shore only — steep coast is bare rock, not sand
 	lowland = mix(lowland, color_sand, beach_t * 0.85);
 
 	// Altitude snow line, lowered toward poles, raised at the equator.
@@ -250,11 +293,16 @@ void fragment() {
 	snow_t = max(snow_t, polar_t * smoothstep(0.40, 0.80, slope));
 	lowland = mix(lowland, color_snow, clamp(snow_t, 0.0, 1.0));
 
-	// Rock on steep slopes regardless of altitude or latitude.
+	// Rock on steep slopes regardless of altitude or latitude — plus an
+	// ALTITUDE floor: above ~700 m bare rock takes over even on the flatter
+	// crests and benches (real summits are stone fields, not turf), which kills
+	// both the "sandy peaks" and the "grass on sharp high hills" reads. The
+	// snow-on-rock pass below then caps the cold ones white.
 	float rock_t = 1.0 - smoothstep(
 		rock_slope_threshold - rock_slope_fade,
 		rock_slope_threshold + rock_slope_fade,
 		slope);
+	rock_t = max(rock_t, smoothstep(700.0, 1000.0, altitude) * 0.85);
 	// Procedural rock TEXTURE — banded dark/light noise driven by a triplanar
 	// fbm sample, then a finer-frequency overlay for surface crack detail.
 	// This is what turns the flat `color_rock` into something that reads as
@@ -297,6 +345,72 @@ void fragment() {
 	base_albedo = mix(base_albedo, triplanar_tinted(base_albedo, wp, wn, detail_scale_b), 0.35);
 
 	ALBEDO = base_albedo;
-	ROUGHNESS = mix(roughness_base * 0.7, roughness_base, rock_t);
-	SPECULAR  = specular_base;
+
+	// Urban ground: under a settlement the terrain itself reads as packed/trodden earth
+	// (the city affects the BIOME — there is no concrete disc on top). v_color.r holds
+	// 1 − urban, so urban climbs toward 1 on the town pad and the over-paint washes out
+	// grass/sand into worn dirt. The street-grid + buildings still sit on top.
+	float urban = clamp(1.0 - v_color.r, 0.0, 1.0);
+	ALBEDO = mix(ALBEDO, color_urban, urban * 0.85);
+
+	// ─── Procedural PBR ground-detail texture (triplanar) ─────────────────────
+	// A seamless grain map generated from noise in world.gd (no texture files),
+	// projected triplanar in object space so it locks to the planet. One sample
+	// drives three PBR channels — albedo grain, roughness variation and the
+	// micro-normal — so the biome ground reads as a real material up close. Faded
+	// out with distance so it doesn't shimmer on far hills.
+	float det_fade = 1.0 - smoothstep(bump_fade_near, bump_fade_far, length(VERTEX));
+	vec3 tw = abs(wn);
+	tw /= max(tw.x + tw.y + tw.z, 1e-4);
+	float grain_raw =
+		  texture(detail_grain_tex, wp.yz * detail_grain_scale).r * tw.x
+		+ texture(detail_grain_tex, wp.zx * detail_grain_scale).r * tw.y
+		+ texture(detail_grain_tex, wp.xy * detail_grain_scale).r * tw.z;
+	float grain = (grain_raw - 0.5) * det_fade;   // centred, distance-faded
+	ALBEDO *= 1.0 + grain * detail_grain_amt * 2.0;
+
+	// ─── PBR response per surface ───────────────────────────────────────────
+	// Roughness/specular vary by what we're standing on: bare rock is matte and
+	// rough, sand a touch smoother, snow/ice noticeably glossier (a low-roughness
+	// sheen), and damp shoreline ground glistens. metallic stays 0 (all dielectric).
+	float wet = smoothstep(beach_altitude + beach_fade, beach_altitude, altitude); // near the waterline
+	float icy = clamp(snow_t + cap_snow + snow_on_rock, 0.0, 1.0);
+	float rough = mix(roughness_base * 0.7, roughness_base, rock_t);  // rock rough, lowland less
+	rough = mix(rough, 0.45, icy);   // ice/snow glossier
+	rough = mix(rough, 0.55, wet);   // wet shore glistens
+	rough += grain * detail_rough_amt * 2.0;   // fine roughness grain from the detail texture
+	rough = mix(rough, 0.95, urban * 0.6);     // urban ground is matte, packed earth
+	ROUGHNESS = clamp(rough, 0.0, 1.0);
+	SPECULAR  = clamp(specular_base + icy * 0.35 + wet * 0.25, 0.0, 1.0);
+
+	// ─── Micro-normal from the SAME detail texture ────────────────────────────
+	// Treat the triplanar grain as a height field and perturb the interpolated
+	// NORMAL by its gradient (Quilez bump-mapping-without-tangents, screen-space
+	// derivatives — no TANGENT/BINORMAL needed). So the generated texture also
+	// supplies surface relief, not just colour.
+	float bstr = bump_strength * det_fade;
+	if (bstr > 0.001) {
+		vec3 N = NORMAL;
+		vec3 dpx = dFdx(VERTEX);
+		vec3 dpy = dFdy(VERTEX);
+		vec3 r1 = cross(dpy, N);
+		vec3 r2 = cross(N, dpx);
+		float det = dot(dpx, r1);
+		if (abs(det) > 1e-8) {
+			vec3 grad = (dFdx(grain_raw) * r1 + dFdy(grain_raw) * r2) / det;
+			NORMAL = normalize(N - bstr * grad);
+		}
+	}
+
+	// ─── Aerial perspective ───────────────────────────────────────────────────
+	vec3 cam_world = INV_VIEW_MATRIX[3].xyz;
+	float cam_alt = length(cam_world - planet_center) - planet_radius;
+	float alt_fade = exp(-max(cam_alt, 0.0) * haze_alt_falloff);
+	float vdist = length(VERTEX);
+	float haze = (1.0 - exp(-vdist * haze_density)) * haze_strength * alt_fade;
+	vec3 frag_world = (INV_VIEW_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	vec3 view_dir = normalize(frag_world - cam_world);
+	float sun_align = clamp(dot(view_dir, -sun_direction), 0.0, 1.0);
+	vec3 hcol = mix(haze_color, haze_sun_color, sun_align * sun_align);
+	ALBEDO = mix(ALBEDO, hcol, clamp(haze, 0.0, 1.0));
 }

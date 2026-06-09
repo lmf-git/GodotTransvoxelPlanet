@@ -20,7 +20,9 @@ extends Node3D
 
 signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, lod_violations: int)
 
-@export var planet_radius : float = 4000.0
+# world.gd sets this from its own planet_radius (ultimately main.gd's 24000); the
+# default matches so a standalone Planet meshes at the real scale.
+@export var planet_radius : float = 24000.0
 @export var world_seed    : int   = 1337
 @export var base_chunk_size : float = 32.0       # smallest chunk side (LOD 0), world units
 @export var max_lod       : int   = 7            # 0 = finest, max_lod = root depth
@@ -47,6 +49,24 @@ signal stats_changed(active_chunks: int, pending_chunks: int, total_tris: int, l
 @export var view_cull_enabled    : bool  = true
 @export var view_cull_margin_deg : float = 14.0   # extra half-angle past the frustum corner so the cull edge sits off-screen
 @export var view_cull_keep_factor: float = 3.0    # near-bubble radius = this × the coarsest collision-chunk size
+
+# Renderer-side occlusion: a sphere occluder just under the deepest possible
+# carve. The horizon/view-cone culls above only stop chunks being GENERATED —
+# already-built far-hemisphere chunks (plus their rocks/foliage, and the moon
+# when it passes behind the planet) sit inside the camera frustum whenever you
+# look at the planet from altitude, so Godot still drew them all behind the
+# body. With occlusion culling on (project setting), this sphere lets the
+# renderer drop those draw calls per instance, including in the shadow passes.
+# Strictly conservative: radius sits below min_surface_radius, so no real
+# terrain (even a cave floor) can ever be wrongly hidden.
+@export var occluder_enabled : bool = true
+
+# Chunks at LOD above this don't cast shadows. The directional sun shadow only
+# reaches ~2.4 km (world.gd directional_shadow_max_distance); a leaf chunk only
+# exists at camera distance ≳ size · lod_factor, so anything coarser than
+# base_chunk_size·2^5 (≈1.5 km at base 48) lies beyond the shadow frustum and
+# was being rendered into the 4 shadow-map splits for nothing.
+@export var shadow_lod_max : int = 5
 
 # Shared scatter resources — created once, referenced by every chunk's
 # MultiMeshInstance3D. Saves N MeshInstances and N materials across N chunks.
@@ -109,6 +129,10 @@ func _ready() -> void:
 	# sampling to it (single source of truth with the mesh — see density.gd).
 	if ClassDB.class_exists("NativeTerrain"):
 		_native = ClassDB.instantiate("NativeTerrain")
+		# Point the native side at user:// for the erosion-bake disk cache BEFORE
+		# any chunk job runs — later launches load the baked field from disk
+		# instead of re-running the droplet simulation at startup.
+		_native.call("set_cache_dir", ProjectSettings.globalize_path("user://"))
 	else:
 		push_error("NativeTerrain GDExtension not loaded — no terrain will mesh.")
 	# Default density is the Earth-like field. world.gd injects a different
@@ -123,10 +147,22 @@ func _ready() -> void:
 		terrain_material = m
 	_scatter_mesh     = TerrainScatter.make_rock_mesh()
 	_scatter_material = TerrainScatter.make_rock_material()
+	# Hand the rock mesh's faces to the native side ONCE so the worker can build the
+	# closest-LOD rock collision soup off the main thread (process-wide; first wins).
+	if _native != null:
+		_native.call("set_rock_proto", _scatter_mesh.get_faces())
 	if enable_foliage:
 		_foliage_meshes   = TerrainScatter.make_foliage_meshes()
 		_foliage_material = TerrainScatter.make_foliage_material()
 	_retraverse_threshold = base_chunk_size / float(voxel_resolution) * 0.5
+	if occluder_enabled:
+		var occ := OccluderInstance3D.new()
+		occ.name = "BodyOccluder"
+		var sph := SphereOccluder3D.new()
+		# 64 m under the strict lower bound — safely inside the deepest carve.
+		sph.radius = maxf(density.min_surface_radius() - 64.0, 1.0)
+		occ.occluder = sph
+		add_child(occ)
 	_camera = _find_camera()
 
 
@@ -167,7 +203,16 @@ func _process(_dt: float) -> void:
 	# stops, stranding a ring of violations. Once everything is balanced and meshed
 	# the queues drain, this falls back to the camera-moved gate, and hovering
 	# costs nothing again (the framerate win).
-	var camera_moved := cam_local.distance_to(_last_cam_local) > _retraverse_threshold
+	# Altitude-scaled gate: near the ground the threshold is ~half a finest voxel
+	# (LOD-0 streaming must track every step), but from altitude no fine chunks
+	# exist, so re-deciding the whole octree per metre of movement is pure waste.
+	# Above the tallest possible terrain the threshold grows with height — at
+	# 10 km up the camera must move ~200 m before the (expensive) traverse +
+	# balance walk re-runs. Measured against the surface BAND (max_surface_radius)
+	# so walking on a high mountain still uses the fine gate.
+	var alt : float = cam_local.length() - density.max_surface_radius()
+	var threshold : float = maxf(_retraverse_threshold, alt * 0.02)
+	var camera_moved := cam_local.distance_to(_last_cam_local) > threshold
 	# Pure rotation moves no chunks but changes which side of the planet is in the
 	# view cone, so it must also re-stream. ~2° hysteresis avoids per-frame churn.
 	var camera_rotated := view_cull_enabled \
@@ -310,6 +355,11 @@ func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_p
 	# Leaf — touch the record so it stays alive this tick.
 	var rec := _ensure_chunk(lod, coords, origin, size)
 	rec.last_seen = _generation
+	# Re-show if it had been hidden as a superseded chunk and the camera has come
+	# back to needing it at this LOD (cheap no-op when already visible). Restores
+	# collision too.
+	if rec.chunk and not rec.chunk.visible:
+		rec.chunk.set_chunk_visible(true)
 
 
 # Returns true if any of the 26 neighbours (6 faces + 12 edges + 8 corners) of
@@ -469,6 +519,7 @@ func _ensure_chunk(lod: int, coords: Vector3i, origin: Vector3, size: float) -> 
 	rec.chunk.foliage_meshes   = _foliage_meshes
 	rec.chunk.foliage_material = _foliage_material
 	rec.chunk.scatter_lod_max  = scatter_lod_max
+	rec.chunk.shadow_lod_max   = shadow_lod_max
 	rec.chunk.planet_radius_for_scatter = planet_radius
 	rec.chunk.sea_level_offset_for_scatter = sea_level_offset
 	# Native mesher + the seed it rebuilds the density from.
@@ -492,29 +543,44 @@ func _ensure_chunk(lod: int, coords: Vector3i, origin: Vector3, size: float) -> 
 func _collect_stale_chunks() -> void:
 	var freed := 0
 	for key in _chunks.keys():
-		if freed >= max_free_chunks_per_tick:
-			break
 		var rec : ChunkRecord = _chunks[key]
 		var age := _generation - rec.last_seen
+		# Current leaf (visited this/last tick) — leave it alone. The 2-tick debounce
+		# avoids reacting to a single-frame traversal hiccup.
+		if age < 2:
+			continue
+		# ATOMIC LOD swap: a stale chunk may only be retired once its replacement is
+		# BOTH meshed AND consistent with its neighbours. For coarsening that means
+		# the parent is meshed *and* the parent's finer neighbours have re-meshed to
+		# include their transition toward it; for refining it means every finer child
+		# covering this volume is meshed. Either guarantees full finer coverage, so
+		# retiring this chunk can't open a hole.
+		# Coarsening: the coarser parent is meshed + neighbour transitions ready.
+		# Refining: the finer geometry covering this cell is fully meshed — at ANY
+		# depth (handles fast multi-LOD jumps, not just the immediate children).
+		var covered_finer := _covered_by_finer(rec.lod, rec.coords, rec.origin, rec.size)
+		var has_replacement := _coarsening_ready(rec) or covered_finer
+
+		# VISUAL swap: HIDE the superseded chunk so it stops rendering ON TOP of its
+		# replacement (the "overlapping layers" bug). CRITICAL: only hide when the
+		# replacement is ACTUALLY VISIBLE and covering, or we punch a hole (the
+		# "chunks disappear on LOD swap" regression). Two safe cases:
+		#   • refining  — finer leaves fully cover this cell (covered_finer), or
+		#   • coarsening — the coarser parent is meshed, transition-ready AND visible.
+		# `_coarsening_ready` alone is NOT enough: during refining a stale node's own
+		# parent is often still meshed from before, which would hide this node before
+		# the finer geometry exists.
+		var hide_ok := covered_finer or _coarser_replacement_visible(rec)
+		if hide_ok and rec.chunk and rec.chunk.visible:
+			rec.chunk.set_chunk_visible(false)
+
+		# MEMORY free stays on the debounced schedule (don't churn the worker pool /
+		# physics server). Only force-free without a replacement after a hard cap so a
+		# wedged transition can't leak forever (would otherwise open a hole).
+		if freed >= max_free_chunks_per_tick:
+			continue
 		if age <= stale_tolerance:
 			continue
-		# Don't drop a chunk while it's still the only mesh covering its
-		# region. That's the "chunks vanish when I move closer" bug: when the
-		# camera crosses a subdivide threshold we stop visiting the parent
-		# and start visiting the 8 children, but the children take time on
-		# the worker pool to mesh. If we free the parent before any child
-		# has a mesh, that volume is uncovered → visible hole. Same in
-		# reverse when the camera moves away (children stale, parent still
-		# meshing). Wait for a viable replacement first; only force-free
-		# after a hard cap so a wedged transition can't leak forever.
-		# ATOMIC LOD swap: only free a stale chunk once its replacement is BOTH
-		# meshed AND consistent with its neighbours. For coarsening that means
-		# the parent is meshed *and* the parent's finer neighbours have re-meshed
-		# to include their transition toward it — otherwise we'd briefly show the
-		# coarse parent next to a still-fine neighbour with no transition (the
-		# transient crack). Holding the old fine chunk until then keeps the
-		# boundary consistent through the swap.
-		var has_replacement := _coarsening_ready(rec) or _has_ready_children(rec)
 		var force_free := age > stale_tolerance * 8
 		if not has_replacement and not force_free:
 			continue
@@ -523,6 +589,18 @@ func _collect_stale_chunks() -> void:
 			rec.chunk.release()
 		_chunks.erase(key)
 		freed += 1
+
+
+# True if rec's coarser parent is a meshed, transition-ready AND currently VISIBLE
+# leaf — i.e. coarsening this away is safe to do VISUALLY (the parent already covers
+# the area on screen). Used as the hide gate for the coarsening direction so we never
+# hide a fine chunk before its coarse replacement is actually drawing.
+func _coarser_replacement_visible(rec: ChunkRecord) -> bool:
+	if not _coarsening_ready(rec):
+		return false
+	var p_coords := Vector3i(rec.coords.x >> 1, rec.coords.y >> 1, rec.coords.z >> 1)
+	var parent : ChunkRecord = _chunks.get(_key(rec.lod + 1, p_coords))
+	return parent != null and parent.chunk != null and parent.chunk.visible
 
 
 # Atomic-swap gate for coarsening: the parent is meshed AND every finer chunk
@@ -567,28 +645,39 @@ func _coarsening_ready(rec: ChunkRecord) -> bool:
 	return true
 
 
-# True if every finer child of `rec` that the octree needs is meshed. Used as
-# a "we can free this coarse chunk now" check during subdivision. Children
-# whose AABB doesn't intersect the planet shell never get spawned, so we
-# treat them as already-satisfied.
-func _has_ready_children(rec: ChunkRecord) -> bool:
-	if rec.lod == 0:
+# True if every shell-intersecting part of this cell is covered by a MESHED leaf at
+# some FINER LOD — i.e. the camera has refined past this chunk and the finer
+# geometry that replaces it is fully present. Covers ANY depth (not just the
+# immediate children): when the camera jumps several LODs at once (a fast descent / the radial LOD
+# frontier sweeping in), the stale coarse chunk's DIRECT children were never created
+# (the traversal went straight to a deeper level), so the one-level check never fired
+# and the coarse chunk lingered — the >1 s overlapping layers. Recursing finds the
+# meshed leaves wherever they actually are. True only on FULL coverage, so hiding /
+# freeing can't open a hole.
+func _covered_by_finer(lod: int, coords: Vector3i, origin: Vector3, size: float, budget: int = 5) -> bool:
+	if lod == 0 or budget <= 0:
+		# Out of depth budget → don't claim coverage. A chunk this far above its
+		# replacement is a teleport-scale jump (rare); the force-free fallback retires
+		# it. The cap keeps the NOT-covered case (e.g. a chunk merely culled behind the
+		# camera) cheap instead of recursing the whole subtree every tick.
 		return false
-	var fine_lod := rec.lod - 1
-	var half := rec.size * 0.5
+	var fine_lod := lod - 1
+	var half := size * 0.5
 	for child in 8:
 		var dx := child & 1
 		var dy := (child >> 1) & 1
 		var dz := (child >> 2) & 1
-		var child_origin := rec.origin + Vector3(dx, dy, dz) * half
+		var child_origin := origin + Vector3(dx, dy, dz) * half
 		if not _aabb_intersects_planet(child_origin, half):
+			continue   # empty sub-cell — never spawned, nothing to cover
+		var child_coords := Vector3i(coords.x * 2 + dx, coords.y * 2 + dy, coords.z * 2 + dz)
+		var c : ChunkRecord = _chunks.get(_key(fine_lod, child_coords))
+		if c != null and c.has_mesh:
+			continue   # owned by a meshed finer leaf
+		# No meshed leaf here yet — the replacement may be finer still; recurse.
+		if _covered_by_finer(fine_lod, child_coords, child_origin, half, budget - 1):
 			continue
-		var child_coords := Vector3i(rec.coords.x * 2 + dx, rec.coords.y * 2 + dy, rec.coords.z * 2 + dz)
-		var child_key := _key(fine_lod, child_coords)
-		if not _chunks.has(child_key):
-			return false
-		if not (_chunks[child_key] as ChunkRecord).has_mesh:
-			return false
+		return false
 	return true
 
 
