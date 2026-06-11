@@ -97,6 +97,9 @@ var _total_tris   : int        = 0
 # stationary. `_retraverse_threshold` is set in _ready to ~half a finest voxel.
 var _last_cam_local      : Vector3 = Vector3(1e20, 1e20, 1e20)
 var _retraverse_threshold: float   = 2.0
+# Diagnostics: how many traversals ran and why ("M"oved / "R"otated / "U"nsettled).
+var _traverse_count      : int     = 0
+var _last_traverse_reason: String  = ""
 # View-cone cull state, recomputed each traversal (all in the planet's LOCAL
 # frame, to match the octree). Rotation also triggers a retraverse — without it,
 # spinning in place (no position change) would never re-stream the new view.
@@ -119,6 +122,13 @@ class ChunkRecord:
 	var size       : float
 	var origin     : Vector3
 	var last_seen  : int = 0
+	# Last generation an actual TRAVERSAL visited this leaf. Distinct from
+	# last_seen: the idle keep-alive branch bumps last_seen on EVERY chunk
+	# (including culled ones), and the violation counter using it oscillated —
+	# idle frames un-staled the culled chunks, their unfixable seams were
+	# counted (hundreds), `octree_unsettled` re-armed, and the expensive
+	# traverse ran every other frame forever (single-digit FPS at 45k tris).
+	var last_visited : int = 0
 	var has_mesh   : bool = false
 	var tri_count  : int = 0
 	var transition_mask : int = 0   # per-face bitmask of "neighbour is FINER" (transition side)
@@ -217,8 +227,22 @@ func _process(_dt: float) -> void:
 	# view cone, so it must also re-stream. ~2° hysteresis avoids per-frame churn.
 	var camera_rotated := view_cull_enabled \
 			and _cam_forward_local.dot(_last_cam_forward_local) < 0.99939
-	var octree_unsettled := not _pending_load.is_empty() or not _pending_remesh.is_empty()
+	# Unsettled ALSO while live 2:1 violations remain: the balance net resolves one
+	# ring per traversal, and the LAST remesh batch can itself expose a new ring —
+	# with both queues drained and the camera still, nothing re-ran traversal and
+	# the violations froze in place ("violations > 0 with 0 pending"). The stat
+	# refreshes ~2×/s, so this keeps traversing until the cascade truly settles.
+	var octree_unsettled := not _pending_load.is_empty() \
+			or not _pending_remesh.is_empty() \
+			or _cached_violations > 0
 	if camera_moved or camera_rotated or octree_unsettled:
+		# Diagnostic counters: the traverse is ~tens of ms, so if it runs every
+		# frame the game is single-digit FPS regardless of triangle count.
+		_traverse_count += 1
+		_last_traverse_reason = "%s%s%s p%d r%d v%d" % [
+			"M" if camera_moved else "", "R" if camera_rotated else "",
+			"U" if octree_unsettled else "",
+			_pending_load.size(), _pending_remesh.size(), _cached_violations]
 		_last_cam_local = cam_local
 		_last_cam_forward_local = _cam_forward_local
 		_traverse_root(cam_local)
@@ -355,6 +379,7 @@ func _visit_node(lod: int, coords: Vector3i, origin: Vector3, size: float, cam_p
 	# Leaf — touch the record so it stays alive this tick.
 	var rec := _ensure_chunk(lod, coords, origin, size)
 	rec.last_seen = _generation
+	rec.last_visited = _generation
 	# Re-show if it had been hidden as a superseded chunk and the camera has come
 	# back to needing it at this LOD (cheap no-op when already visible). Restores
 	# collision too.
@@ -692,9 +717,29 @@ func _count_balance_violations() -> int:
 	var count := 0
 	for key in _chunks.keys():
 		var rec : ChunkRecord = _chunks[key]
+		# Skip chunks traversal no longer visits (view-cone/horizon-culled, awaiting
+		# stale-free). Their violations are invisible AND unfixable — the balance net
+		# only splits nodes it visits — so counting them both lied on the HUD and,
+		# now that violations keep traversal alive, would have spun re-traversal
+		# forever on seams behind the camera. Must use last_VISITED, not last_seen:
+		# the idle keep-alive branch bumps last_seen on every chunk including the
+		# culled ones, which un-staled them and made this count oscillate (idle →
+		# hundreds counted → unsettled → traverse storm → 0 → idle → ...).
+		if _generation - rec.last_visited >= 2:
+			continue
 		for face_bit in 6:
 			var nbr := _coarsest_face_neighbour(rec, face_bit)
 			if nbr == null:
+				continue
+			# Same reasoning as the rec skip above, from the other side: when the
+			# COARSE neighbour is view-cone/horizon-culled, traversal never visits
+			# it, so the balance net cannot split it — the violation is unfixable
+			# until the camera turns (at which point it's visited and resolved).
+			# Counting it kept `octree_unsettled` true FOREVER, which re-ran the
+			# full traverse + balance + neighbour-mask walk every single frame —
+			# a permanent main-thread drain (single-digit FPS at tiny tri counts)
+			# for seams that sit outside the view cone anyway.
+			if _generation - nbr.last_visited >= 2:
 				continue
 			if absi(nbr.lod - rec.lod) >= 2:
 				count += 1

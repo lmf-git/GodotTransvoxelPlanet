@@ -395,6 +395,12 @@ impl ErosionField {
         }
     }
 
+    /// Raw grids for GPU consumption: (w, h, flow 0..1, delta metres).
+    /// Empty (w = h = 0) on the no-erosion field.
+    pub fn maps(&self) -> (usize, usize, &[f32], &[f32]) {
+        (self.w, self.h, &self.flow, &self.delta)
+    }
+
     /// Largest deposition rise the field adds (metres, ≥ 0).
     pub fn max_rise(&self) -> f32 {
         self.max_rise

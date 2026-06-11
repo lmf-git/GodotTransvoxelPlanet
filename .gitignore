@@ -4,6 +4,7 @@
 .DS_Store
 export.cfg
 export_presets.cfg
+reference/
 
 # Rust / cargo build artifacts (the native GDExtension is built locally;
 # only the source, Cargo.toml and Cargo.lock are tracked).

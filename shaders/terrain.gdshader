@@ -125,6 +125,14 @@ varying vec4 v_color;
 // Packed/trodden urban ground colour the terrain blends toward under a settlement.
 uniform vec3 color_urban : source_color = vec3(0.34, 0.31, 0.27);
 
+// Baked global erosion (equirect, object-space +Y pole — same mapping as the
+// Rust bake): R = drainage flow 0..1, G = height delta remapped over ±range.
+// Lets the ground READ the land's history — wet sediment along channels,
+// lusher deposition valleys — instead of colouring by local noise alone.
+// `erosion_delta_range` = 0 (no texture bound) disables the whole pass.
+uniform sampler2D erosion_tex : hint_default_black, filter_linear, repeat_enable;
+uniform float erosion_delta_range = 0.0;
+
 
 // ─── Cheap pseudo-hash + value noise ────────────────────────────────────────
 
@@ -273,6 +281,24 @@ void fragment() {
 	// Blend lowland ↔ highland by elevation.
 	lowland = mix(lowland, highland, elev_t);
 
+	// ─── Erosion-data-driven ground read ─────────────────────────────────────
+	// Drainage channels darken into wet packed sediment; deposition valleys grow
+	// lusher (warm climates only — a sediment-filled arctic valley isn't green).
+	float ero_channel = 0.0;
+	if (erosion_delta_range > 0.5) {
+		float e_lon = atan(radial.z, radial.x);
+		if (e_lon < 0.0) { e_lon += 6.2831853; }
+		vec2 euv = vec2(e_lon / 6.2831853,
+				asin(clamp(radial.y, -1.0, 1.0)) / 3.14159265 + 0.5);
+		vec2 ero = texture(erosion_tex, euv).rg;
+		float edelta = (ero.g * 2.0 - 1.0) * erosion_delta_range;
+		ero_channel = smoothstep(0.06, 0.35, ero.r);
+		float lush = smoothstep(2.0, 25.0, edelta) * (1.0 - elev_t)
+				* smoothstep(0.25, 0.55, temperature);
+		lowland = mix(lowland, color_grass * vec3(0.80, 1.0, 0.80), lush * 0.5);
+		lowland = mix(lowland, color_dirt * 0.6, ero_channel * 0.45);
+	}
+
 	// Equatorial dense jungle on flat humid lowland — keep as an explicit
 	// "always there at the equator if not too dry" pass so the equator still
 	// has its visual signature even when temp_anom dips locally.
@@ -309,12 +335,18 @@ void fragment() {
 	// stone (alternating shadow bands, lighter spots where the rock catches
 	// the sun) rather than a uniform grey. Sampled in object space so it
 	// stays locked to the planet as it spins.
+	// View distance, shared by the shader-detail LOD below, the detail-texture
+	// fade and the haze. Distant pixels skip the expensive octaves entirely —
+	// they're sub-pixel there (and shimmered); most terrain pixels in flight
+	// are far, so this is a real per-frame saving.
+	float view_d = length(VERTEX);
+	int roct = view_d < 2500.0 ? 4 : 2;
 	vec3 ax = abs(wn);
 	float wsum_rock = max(ax.x + ax.y + ax.z, 1e-4);
 	vec3 rblend = ax / wsum_rock;
-	float rband_x = fbm3(wp.yzx * rock_texture_scale, 4);
-	float rband_y = fbm3(wp.zxy * rock_texture_scale + 11.0, 4);
-	float rband_z = fbm3(wp.xyz * rock_texture_scale + 23.0, 4);
+	float rband_x = fbm3(wp.yzx * rock_texture_scale, roct);
+	float rband_y = fbm3(wp.zxy * rock_texture_scale + 11.0, roct);
+	float rband_z = fbm3(wp.xyz * rock_texture_scale + 23.0, roct);
 	float rband = rband_x * rblend.x + rband_y * rblend.y + rband_z * rblend.z;
 	rband = smoothstep(0.30, 0.70, rband);                  // sharpen to read as banding, not smear
 	vec3 rock_textured = mix(color_rock_dark, color_rock_light, rband);
@@ -340,9 +372,14 @@ void fragment() {
 	float cap_snow = polar_t * smoothstep(0.12, 0.45, slope);
 	base_albedo = mix(base_albedo, color_snow, clamp(cap_snow, 0.0, 1.0));
 
-	// Triplanar detail to break up the surface at close range.
-	base_albedo = triplanar_tinted(base_albedo, wp, wn, detail_scale_a);
-	base_albedo = mix(base_albedo, triplanar_tinted(base_albedo, wp, wn, detail_scale_b), 0.35);
+	// Triplanar detail to break up the surface at close range — skipped at
+	// distance (24 noise evaluations/pixel that are sub-pixel beyond ~3 km).
+	float detail_lod = 1.0 - smoothstep(2500.0, 4000.0, view_d);
+	if (detail_lod > 0.001) {
+		vec3 det = triplanar_tinted(base_albedo, wp, wn, detail_scale_a);
+		det = mix(det, triplanar_tinted(det, wp, wn, detail_scale_b), 0.35);
+		base_albedo = mix(base_albedo, det, detail_lod);
+	}
 
 	ALBEDO = base_albedo;
 
@@ -378,6 +415,7 @@ void fragment() {
 	float rough = mix(roughness_base * 0.7, roughness_base, rock_t);  // rock rough, lowland less
 	rough = mix(rough, 0.45, icy);   // ice/snow glossier
 	rough = mix(rough, 0.55, wet);   // wet shore glistens
+	rough = mix(rough, 0.50, ero_channel * 0.6);   // drainage channels stay damp
 	rough += grain * detail_rough_amt * 2.0;   // fine roughness grain from the detail texture
 	rough = mix(rough, 0.95, urban * 0.6);     // urban ground is matte, packed earth
 	ROUGHNESS = clamp(rough, 0.0, 1.0);

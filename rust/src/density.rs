@@ -58,12 +58,15 @@ const CITY_BLEND: f32 = 560.0;          // graded skirt — long + gentle so the
 // the pad without a jump) but not 100%, so the town still reads as settled into the
 // land rather than a stamped circle. (0.62 was too loose — the undulation broke the
 // in-town roads and made the highway-edge transition jump.)
-// Pushed to near-flat (was 0.82): a partially-flattened pad UNDULATES, and the
-// city's pavement/streets/buildings are draped on a coarse analytic height grid that
-// can't track that undulation — so they floated over the dips / poked through the
-// rises. A near-flat pad (cities ARE flat) makes the draped ground match the mesh, so
-// small lifts sit the foundation flush. The relief-gated siting keeps the rim gentle.
-const CITY_FLATTEN: f32 = 0.95;
+// FULLY flat (1.0; was 0.95 — and 0.82/0.62 before that, each step chasing the
+// same artifact): ANY residual undulation makes buildings/streets float, because
+// the visuals drape on the ANALYTIC surface while the ground is a marching-cubes
+// mesh at 6–24 m voxels — the mesh reproduces leftover undulation with a
+// per-LOD smoothing the drape grid can't match. At 1.0 the pad interior is an
+// exact sphere patch at target_r, which every LOD meshes to the same surface
+// (only sub-metre curvature error), so foundations finally sit flush. The town
+// still reads settled-in via the long skirt and the mean-height anchoring.
+const CITY_FLATTEN: f32 = 1.0;
 // Smaller settlements seeded ALONG the roads between cities, so the world reads as a
 // network of connected places of varying size (the Rust-on-a-planet feel) rather
 // than a few big cities in the void. Each gets a smaller flat pad.
@@ -252,6 +255,88 @@ fn rand_unit(seed: i32, i: u32) -> [f32; 3] {
     [s * phi.cos(), z, s * phi.sin()]
 }
 
+// ── Tectonic plates ──────────────────────────────────────────────────────────
+// Voronoi plates on the sphere, each with a drift vector. Where neighbouring
+// plates CONVERGE (drift vectors closing) the boundary uplifts into a mountain
+// ARC; where they DIVERGE it drops into a rift/trench. This gives ranges the
+// long curved chains real planets have (and NMS/Star Citizen fake) instead of
+// noise blobs, and gives continents plate-shaped structure: each plate also
+// carries a small height bias (continental vs oceanic character) blended
+// smoothly across boundaries.
+const PLATE_COUNT: usize = 18;
+const PLATE_EDGE_WIDTH: f32 = 0.10;  // boundary band in (cos1 − cos2) units (~ a few km)
+const PLATE_RIFT_DEPTH: f32 = 350.0; // divergent-boundary trench depth (m)
+const PLATE_BIAS_AMP: f32 = 130.0;   // per-plate interior height bias (±m)
+
+struct Plates {
+    seeds: Vec<[f32; 3]>,
+    drift: Vec<[f32; 3]>, // unit tangent drift direction per plate
+    bias: Vec<f32>,       // per-plate interior height bias (m)
+}
+
+fn build_plates(seed: i32) -> Plates {
+    let mut seeds = Vec::with_capacity(PLATE_COUNT);
+    let mut drift = Vec::with_capacity(PLATE_COUNT);
+    let mut bias = Vec::with_capacity(PLATE_COUNT);
+    for i in 0..PLATE_COUNT as u32 {
+        let s = rand_unit(seed ^ 0x71A7, i);
+        // Random tangent drift: a second random dir projected off the seed dir.
+        let r = rand_unit(seed ^ 0x0D21F7, i);
+        let along = dot(r, s);
+        let mut t = [r[0] - s[0] * along, r[1] - s[1] * along, r[2] - s[2] * along];
+        let tl = dot(t, t).sqrt().max(1e-5);
+        t = [t[0] / tl, t[1] / tl, t[2] / tl];
+        seeds.push(s);
+        drift.push(t);
+        bias.push((hash_u32((seed as u32) ^ i.wrapping_mul(0x5851F42D)) as f32
+            / u32::MAX as f32
+            * 2.0
+            - 1.0)
+            * PLATE_BIAS_AMP);
+    }
+    Plates { seeds, drift, bias }
+}
+
+impl Plates {
+    /// (arc, rift, bias) at a unit direction: `arc` ∈ [0,1] peaks on convergent
+    /// boundaries (mountain chains), `rift` ∈ [0,1] on divergent ones (trenches),
+    /// `bias` is the smoothly-blended interior height offset in metres.
+    fn evaluate(&self, d: [f32; 3]) -> (f32, f32, f32) {
+        let (mut i1, mut c1) = (0usize, -2.0f32);
+        let (mut i2, mut c2) = (0usize, -2.0f32);
+        for (i, s) in self.seeds.iter().enumerate() {
+            let c = dot(d, *s);
+            if c > c1 {
+                i2 = i1;
+                c2 = c1;
+                i1 = i;
+                c1 = c;
+            } else if c > c2 {
+                i2 = i;
+                c2 = c;
+            }
+        }
+        // Boundary proximity: equidistant from the two nearest seeds → c1 ≈ c2.
+        let edge = 1.0 - smoothstep(0.0, PLATE_EDGE_WIDTH, c1 - c2);
+        // Relative motion projected on the inter-plate direction: positive =
+        // plates closing (collision/orogeny), negative = opening (rift).
+        let m = [
+            self.seeds[i2][0] - self.seeds[i1][0],
+            self.seeds[i2][1] - self.seeds[i1][1],
+            self.seeds[i2][2] - self.seeds[i1][2],
+        ];
+        let ml = dot(m, m).sqrt().max(1e-5);
+        let m = [m[0] / ml, m[1] / ml, m[2] / ml];
+        let conv = dot(self.drift[i1], m) - dot(self.drift[i2], m);
+        let arc = edge * (conv * 0.9).clamp(0.0, 1.0);
+        let rift = edge * (-conv * 0.9).clamp(0.0, 1.0);
+        // Interior bias, blended across the boundary (softmax-ish, seam-free).
+        let w2 = ((c2 - c1) / 0.04).exp().min(1.0);
+        let bias = (self.bias[i1] + self.bias[i2] * w2) / (1.0 + w2);
+        (arc, rift, bias)
+    }
+}
+
 pub struct PlanetDensity {
     radius: f32,
     enable_caves: bool,
@@ -266,6 +351,9 @@ pub struct PlanetDensity {
     terrace: Noise,
     canyon: Noise,
     biome: Noise,
+    // Tectonic plates — the macro skeleton: mountain arcs on convergent
+    // boundaries, rifts on divergent ones, per-plate interior bias.
+    plates: Plates,
     // Shared, build-once settlement graph for this body (Arc-cloned from the
     // process-wide cache; empty for bodies below SETTLEMENT_MIN_RADIUS).
     settlements: Arc<Settlements>,
@@ -299,6 +387,7 @@ impl PlanetDensity {
             terrace: mk(seed + 911, Fbm, 0.0009, 3, 2.0, 0.5),
             canyon: mk(seed + 977, Ridged, 0.0008, 3, 2.0, 0.5),
             biome: mk(seed + 1031, Fbm, 0.00018, 3, 2.0, 0.5),
+            plates: build_plates(seed),
             settlements: empty_settlements(),
             erosion: erosion::empty_field(),
             min_bound: 0.0,
@@ -432,6 +521,14 @@ impl PlanetDensity {
                 if relief > CITY_MAX_RELIEF {
                     continue; // too sloped — a pad here would step at the rim
                 }
+                // The pad flattens to the footprint MEAN — so the MEAN must clear
+                // the sea, not just the centre sample. A candidate centred on an
+                // islet with most of its footprint submerged passed the centre
+                // check and then flattened the whole town below the waterline
+                // (and the coastal sort PREFERRED those, being lowest).
+                if self.radius + mean_h <= min_target {
+                    continue;
+                }
                 // Also gate on the SKIRT ring: flat pad ground means nothing if the
                 // terrain falls off a shelf just past the rim — the pad would sit on
                 // a high table with roads diving off it. Allow somewhat more relief
@@ -529,6 +626,9 @@ impl PlanetDensity {
                 let (relief, mean_h) = self.pad_stats(d, TOWN_PAD_RADIUS);
                 if relief > TOWN_MAX_RELIEF {
                     continue; // too sloped for a clean town pad
+                }
+                if self.radius + mean_h <= min_target {
+                    continue; // footprint mean below the waterline — see city gate
                 }
                 let (skirt_relief, _) = self.pad_stats(d, TOWN_PAD_RADIUS + CITY_BLEND * 0.7);
                 if skirt_relief > TOWN_MAX_RELIEF * 1.6 {
@@ -784,6 +884,11 @@ impl PlanetDensity {
         &self.settlements.cities
     }
 
+    /// Baked erosion grids (w, h, flow, delta) — see ErosionField::maps.
+    pub fn erosion_maps(&self) -> (usize, usize, &[f32], &[f32]) {
+        self.erosion.maps()
+    }
+
     pub fn city_pad_radius(&self) -> f32 {
         CITY_PAD_RADIUS
     }
@@ -826,16 +931,19 @@ impl PlanetDensity {
     pub fn max_surface_radius(&self) -> f32 {
         // + erosion deposition: erosion can RAISE the surface (sediment fill), so
         // the upper bound must include the field's largest rise or culling drops
-        // chunks holding deposited highs.
+        // chunks holding deposited highs. + plate interior bias (arcs reuse the
+        // ridge budget via the belt mask, so they add no extra height).
         self.radius + 361.0 + MAX_TERRAIN_HEIGHT + 65.0 + 6.0 + MAX_SPIRE_HEIGHT + MAX_PLATEAU_RISE
-            + 150.0 + self.erosion.max_rise()
+            + 150.0 + PLATE_BIAS_AMP + self.erosion.max_rise()
     }
 
     /// Strict lower bound on the surface radius (deepest possible carve).
     /// Mirrors density.gd::min_surface_radius.
     pub fn min_surface_radius(&self) -> f32 {
         // − erosion incision: carved valleys cut below the raw surface.
-        self.radius - 779.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH - self.erosion.max_drop()
+        // − plate rifts/trenches and the negative interior bias.
+        self.radius - 779.0 - MAX_CANYON_DEPTH - CAVE_BOTTOM_DEPTH
+            - PLATE_RIFT_DEPTH - PLATE_BIAS_AMP - self.erosion.max_drop()
     }
 
     /// Terrain height displacement at a point (surface_r = radius + this), BEFORE
@@ -883,8 +991,22 @@ impl PlanetDensity {
         let region = self.uber.get_noise_3d(x + uwx, y + uwy, z + uwz);
         // Slightly broader, lower-threshold mountain belts so ranges are more
         // prevalent and the planet reads as having real cordilleras, not isolated bumps.
-        let mountain_belt = smoothstep(0.05, 0.42, region);
+        let noise_belt = smoothstep(0.05, 0.42, region);
         let hill_belt = 1.0 - smoothstep(-0.30, 0.25, region);
+
+        // Tectonics: evaluate the plate field at the WARPED direction (reusing the
+        // uber warp) so boundaries wander like real sutures instead of perfect
+        // Voronoi arcs. Convergent boundaries inject mountain belt — ranges now
+        // form long curved CHAINS along plate seams (the geology noise alone
+        // can't produce); divergent boundaries cut rift valleys / ocean trenches;
+        // plate interiors carry a smooth height bias so coastlines inherit
+        // plate-scale structure.
+        let wl = ((x + uwx) * (x + uwx) + (y + uwy) * (y + uwy) + (z + uwz) * (z + uwz))
+            .sqrt()
+            .max(1e-4);
+        let wdir = [(x + uwx) / wl, (y + uwy) / wl, (z + uwz) / wl];
+        let (arc, rift, plate_bias) = self.plates.evaluate(wdir);
+        let mountain_belt = (noise_belt + arc).min(1.0);
 
         // Ridged MULTIFRACTAL ridges: detail rides the crests and fades in the valleys,
         // so ranges have sharp, connected ridgelines instead of round bumps. (Was a
@@ -929,6 +1051,8 @@ impl PlanetDensity {
             + spire * MAX_SPIRE_HEIGHT
             + plateau * MAX_PLATEAU_RISE
             - canyon * MAX_CANYON_DEPTH
+            + plate_bias
+            - rift * PLATE_RIFT_DEPTH
     }
 
     /// Blend the raw surface radius toward a flat city pad / graded road
@@ -1013,8 +1137,13 @@ impl PlanetDensity {
         }
 
         // Weight-blended union: targets mix by relative strength, so the surface
-        // is continuous across the pad↔road handover; overall pull toward the
-        // blended target uses the stronger of the two weights.
+        // is continuous across the pad↔road handover. The road's influence is
+        // additionally scaled by (1 − wc) — PAD PRIORITY: roads run THROUGH town
+        // pads (towns are seeded on the road arcs), and without the fade the
+        // road grade would average against the pad height and trench a groove
+        // across what must stay flat, buildable ground. Still continuous: the
+        // fade ramps over the same skirt the pad weight does.
+        let wr = wr * (1.0 - wc);
         let wsum = wc + wr;
         if wsum <= 0.0 {
             return surface_r;
@@ -1092,39 +1221,43 @@ impl PlanetDensity {
         let hy = (hi[1] - lo[1]) * 0.5;
         let hz = (hi[2] - lo[2]) * 0.5;
         let cr = (hx * hx + hy * hy + hz * hz).sqrt(); // chunk bounding-sphere radius
-        let within = |p: [f32; 3], reach: f32| -> bool {
-            let dx = cc[0] - p[0];
-            let dy = cc[1] - p[1];
-            let dz = cc[2] - p[2];
-            dx * dx + dy * dy + dz * dz <= reach * reach
+        let cl = (cc[0] * cc[0] + cc[1] * cc[1] + cc[2] * cc[2]).sqrt();
+        // CONE test, not point-sphere. The carve shifts surface_r along a DIRECTION,
+        // so it changes the density at EVERY radius on that direction — its 3D
+        // support is a cone around the pad/road axis, infinite radially. The old
+        // test (sphere around the pad point at pad height) missed samples radially
+        // offset from the pad height: skirt terrain sitting above/below the pad was
+        // inside the carve cone but outside the sphere, so two chunks at different
+        // LODs could DISAGREE about skipping the carve while it was non-zero on
+        // their shared face — the cracks ringing the city buffer zone. Distance
+        // from the chunk's bounding sphere to the axis ray, against the cone's
+        // lateral half-width at the chunk's outermost radius, is conservative at
+        // every height.
+        let near_axis = |d: [f32; 3], half_ang: f32| -> bool {
+            let along = cc[0] * d[0] + cc[1] * d[1] + cc[2] * d[2];
+            if along <= 0.0 {
+                // Chunk centre on the far side of the planet: the forward cone only
+                // comes near it if the box reaches the planet centre (huge roots).
+                return cl <= cr;
+            }
+            let dist_axis = (cl * cl - along * along).max(0.0).sqrt();
+            dist_axis <= cr + (along + cr) * half_ang
         };
         for c in &st.cities {
-            let p = [c.dir[0] * c.target_r, c.dir[1] * c.target_r, c.dir[2] * c.target_r];
-            if within(p, cr + c.pad_radius + CITY_BLEND) {
+            if near_axis(c.dir, (c.pad_radius + CITY_BLEND) / self.radius) {
                 return true;
             }
         }
-        // Sample each road's carved centreline; each point's reach covers the corridor
-        // plus the half-gap back to the previous sample, so the whole arc is covered.
+        // Sample each road arc; the angular inflation covers the half-gap between
+        // consecutive samples so the whole corridor cone-sheet is covered.
         let steps = 24usize;
         for rd in &st.roads {
-            let mut prev: Option<[f32; 3]> = None;
+            let seg_half_ang = 0.5 * rd.arc / steps as f32;
+            let half_ang = (ROAD_HALF_WIDTH + ROAD_BLEND) / self.radius + seg_half_ang;
             for i in 0..=steps {
                 let t = i as f32 / steps as f32;
                 let d = slerp_dir(rd.a, rd.b, t);
-                let rr = sample_profile(&rd.prof, t);
-                let p = [d[0] * rr, d[1] * rr, d[2] * rr];
-                let seg = match prev {
-                    Some(q) => {
-                        let dx = p[0] - q[0];
-                        let dy = p[1] - q[1];
-                        let dz = p[2] - q[2];
-                        0.5 * (dx * dx + dy * dy + dz * dz).sqrt()
-                    }
-                    None => 0.0,
-                };
-                prev = Some(p);
-                if within(p, cr + ROAD_HALF_WIDTH + ROAD_BLEND + seg) {
+                if near_axis(d, half_ang) {
                     return true;
                 }
             }

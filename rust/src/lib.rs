@@ -357,6 +357,33 @@ impl NativeTerrain {
         PackedVector3Array::from(pts.as_slice())
     }
 
+    /// The baked global erosion field packed for the terrain shader: an RG8
+    /// equirect image (R = drainage flow 0..1, G = height delta remapped to
+    /// 0..1 over ±range). Built in Rust because packing 4.7M cells in GDScript
+    /// would stall startup. { w, h, range, data: PackedByteArray }; w = 0 for
+    /// bodies without erosion (the moon).
+    #[func]
+    fn erosion_texture(&self, seed: i64, radius: f64) -> VarDictionary {
+        let density = density::shared(seed as i32, radius as f32);
+        let (w, h, flow, delta) = density.erosion_maps();
+        let mut range = 0.0f32;
+        for &d in delta {
+            range = range.max(d.abs());
+        }
+        range = range.max(1e-3);
+        let mut bytes: Vec<u8> = Vec::with_capacity(w * h * 2);
+        for i in 0..w * h {
+            bytes.push((flow[i].clamp(0.0, 1.0) * 255.0) as u8);
+            bytes.push(((delta[i] / range * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8);
+        }
+        let mut dict = VarDictionary::new();
+        dict.set("w", w as i64);
+        dict.set("h", h as i64);
+        dict.set("range", range as f64);
+        dict.set("data", PackedByteArray::from(bytes.as_slice()));
+        dict
+    }
+
     /// Drain ALL finished meshes in a single call. Returns an Array of
     /// Dictionaries, each = { id, positions, normals, indices, empty }. One lock
     /// + one FFI hop for the whole batch (vs a poll + a take-per-chunk round-trip

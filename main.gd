@@ -82,7 +82,7 @@ func _build_hud() -> void:
 	vbox.add_child(time_label)
 
 	var help := _make_label("")
-	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [M] planet/moon  [G] next town  [C] clouds  [`] wireframe  [Esc] release mouse"
+	help.text = "[WASD] move  [Space/Shift] up-down  [Q/E] roll  [LAlt] boost  [F] flight/walk  [M] planet/moon  [G] next town  [C] clouds  [`] wireframe  [Esc] release mouse\nWALK: [1] rifle  [2] pistol  [RMB] aim  [LMB] fire  [O] 1st/3rd person  [E] enter/exit vehicle  [V] spawn plane  [B] spawn car"
 	help.modulate = Color(1, 1, 1, 0.75)
 	vbox.add_child(help)
 
@@ -130,6 +130,46 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo \
 			and (event as InputEventKey).keycode == KEY_G:
 		_jump_to_next_settlement()
+	# Debug vehicle spawns for testing: [V] = aircraft, [B] = car, dropped on
+	# the ground just in front of the player.
+	if event is InputEventKey and event.pressed and not event.echo \
+			and (event as InputEventKey).keycode == KEY_V:
+		_spawn_test_vehicle(true)
+	if event is InputEventKey and event.pressed and not event.echo \
+			and (event as InputEventKey).keycode == KEY_B:
+		_spawn_test_vehicle(false)
+
+
+# Spawn a test vehicle ~12 m ahead of the player, sitting on the terrain
+# surface, facing the same way. Parented to the focused planet so it rides the
+# spin (vehicles freeze kinematic while parked).
+func _spawn_test_vehicle(is_plane: bool) -> void:
+	var target_planet : Planet = world.moon if _focus_moon else world.planet
+	var up := (-target_planet.gravity_dir(player.global_position)).normalized()
+	var fwd := -player.global_transform.basis.z
+	fwd = (fwd - up * fwd.dot(up)).normalized()
+	if fwd.length_squared() < 1e-4:
+		fwd = up.cross(Vector3.RIGHT).normalized()
+	# Drop point: ahead of the player, snapped to the surface via altitude.
+	var ahead := player.global_position + fwd * 12.0
+	var alt := target_planet.altitude_above_surface(ahead)
+	var ground := ahead - up * alt
+
+	var v : RigidBody3D
+	if is_plane:
+		var a := Aircraft.new()
+		a.planet = target_planet
+		v = a
+	else:
+		var c := Car.new()
+		c.planet = target_planet
+		v = c
+	v.name = ("TestPlane" if is_plane else "TestCar") + str(Time.get_ticks_msec())
+	v.freeze = true   # parked: ride the planet spin until mounted
+	target_planet.add_child(v)
+	# Right-handed: x = y × z = up × (-fwd).
+	var vbasis := Basis(up.cross(-fwd).normalized(), up, -fwd).orthonormalized()
+	v.global_transform = Transform3D(vbasis, ground + up * (1.6 if is_plane else 1.0))
 
 
 # Reparent + reposition the player onto the planet (false) or the moon (true).

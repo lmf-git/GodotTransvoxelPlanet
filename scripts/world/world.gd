@@ -476,6 +476,7 @@ func _build_planet_system() -> void:
 	terrain_mat.set_shader_parameter("detail_grain_tex", _make_detail_grain_texture())
 	planet.terrain_material = terrain_mat
 	planet_system.add_child(planet)
+	_apply_erosion_maps()
 	_build_settlements()
 	_build_rivers()
 	_build_landmarks()
@@ -533,8 +534,13 @@ func _build_planet_system() -> void:
 	var wr := planet_radius + sea_level_offset
 	wmesh.radius = wr
 	wmesh.height = wr * 2.0
-	wmesh.radial_segments = 96
-	wmesh.rings = 48
+	# Dense tessellation: chord sag between sphere vertices is R·θ²/8 — at 96
+	# segments on a ~24 km sphere that was ~13 m, so the polygonal sea surface
+	# dipped metres below true sea level between vertices and opened visible
+	# gaps against the terrain along shorelines. 384/192 brings the sag under
+	# ~0.8 m; the vertex count (~74k) is trivial for one static mesh.
+	wmesh.radial_segments = 384
+	wmesh.rings = 192
 	water.mesh = wmesh
 	water.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	water.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
@@ -606,6 +612,28 @@ func _make_detail_grain_texture() -> NoiseTexture2D:
 	n.seed = 1234
 	tex.noise = n
 	return tex
+
+
+# Hand the baked erosion data (drainage flow + height delta) to the terrain
+# shader as an equirect RG8 texture. The ground then READS the land's history —
+# wet dark sediment along drainage channels, lusher deposition valleys — instead
+# of colouring by local noise alone. ~9.4 MB of VRAM for the 3072×1536 grid.
+# (Building the density here triggers the erosion bake/load synchronously; with
+# the disk cache that's a file read on every run after the first.)
+func _apply_erosion_maps() -> void:
+	if not ClassDB.class_exists("NativeTerrain"):
+		return
+	var nt : Object = ClassDB.instantiate("NativeTerrain")
+	var em : Dictionary = nt.call("erosion_texture", world_seed, planet_radius)
+	var w : int = em.get("w", 0)
+	var h : int = em.get("h", 0)
+	var data : PackedByteArray = em.get("data", PackedByteArray())
+	if w <= 0 or h <= 0 or data.size() != w * h * 2:
+		return
+	var img := Image.create_from_data(w, h, false, Image.FORMAT_RG8, data)
+	var tex := ImageTexture.create_from_image(img)
+	terrain_mat.set_shader_parameter("erosion_tex", tex)
+	terrain_mat.set_shader_parameter("erosion_delta_range", float(em.get("range", 0.0)))
 
 
 func _build_settlements() -> void:
@@ -696,6 +724,39 @@ func _build_settlements() -> void:
 						hwy_a.append(sa)
 						hwy_b.append(sb)
 
+		# ── Layout archetype ─────────────────────────────────────────────────
+		# Same lot/street machinery, different ZONING GEOMETRY per settlement, so
+		# towns stop sharing one circular core-ring-fringe stamp:
+		#   0 GRID       — radial districts (the classic downtown-in-the-middle)
+		#   1 LINEAR     — strip town stretched along the incoming highway
+		#   2 WATERFRONT — downtown faces the downhill (sea) side, industry inland
+		#   3 PLAZA      — open central square ringed by a dense civic core
+		var arch_roll := rng.randf()
+		var is_town := pad_radius_i < 200.0
+		# Airport settlements: every third CITY gets an airfield strip on the pad
+		# fringe — a runway corridor (buildings cleared below), hangars, a tower
+		# and a parked flyable aircraft. air_oz is the runway centreline's lateral
+		# offset in the (tangent, bitan) pad frame.
+		var has_airport := (not is_town) and (ci % 3 == 0)
+		var air_oz := pave_r * 0.55
+		var arch : int
+		if is_town:
+			# Small settlements: mostly strips and plaza villages.
+			arch = 1 if arch_roll < 0.45 else (3 if arch_roll < 0.70 else 0)
+		else:
+			arch = 0 if arch_roll < 0.28 else (2 if arch_roll < 0.55 else (1 if arch_roll < 0.78 else 3))
+		# LINEAR aligns the whole frame (streets, blocks, buildings) to the highway
+		# that enters town, so the strip follows the road instead of a random yaw.
+		if arch == 1 and hwy_a.size() > 0:
+			var seg := hwy_b[0] - hwy_a[0]
+			seg = seg - up * seg.dot(up)
+			if seg.length() > 1e-3:
+				tangent = seg.normalized()
+				bitan = up.cross(tangent).normalized()
+		# Per-city fabric knobs: block pitch and skyline height vary city to city.
+		var cell := CELL * rng.randf_range(0.85, 1.18)
+		var h_mult := rng.randf_range(0.75, 1.35)
+
 		# Sample the REAL carved ground across the pad in ONE native call, so the town
 		# drapes onto the terrain (the pad is near-flat now) instead of a stamped flat
 		# disc. A GRID×GRID height field over [-pad_radius, pad_radius] is then bilinear-
@@ -728,17 +789,56 @@ func _build_settlements() -> void:
 			var surf : float = lerp(h0, h1, tz)
 			return (center + tangent * ox + bitan * oz).normalized() * (surf + h)
 
+		# WATERFRONT: find the inland (uphill) direction from the height grid we just
+		# sampled — least-squares slope of the carved ground across the footprint.
+		# Downtown sits on the low (sea-facing) edge, industry drifts uphill/inland.
+		var inland2 := Vector2.RIGHT
+		if arch == 2:
+			var gsum := Vector2.ZERO
+			for gz in grid:
+				for gx in grid:
+					var ox0 := (float(gx) / float(grid - 1) * 2.0 - 1.0) * span
+					var oz0 := (float(gz) / float(grid - 1) * 2.0 - 1.0) * span
+					gsum += Vector2(ox0, oz0) * gheights[gz * grid + gx]
+			if gsum.length() > 1e-3:
+				inland2 = gsum.normalized()
+		var plaza_open := maxf(cell * 1.1, pave_r * 0.18)   # PLAZA centre kept clear
+		var strip_half := pave_r * 0.55                      # LINEAR lateral extent
+
+		# District factor per block (0 = densest core, 1 = sparse fringe), shaped by
+		# the archetype. The downstream core/residential/industrial buckets are
+		# unchanged — only WHERE each district lands differs.
+		var zone := func(bx: float, bz: float) -> float:
+			match arch:
+				1:  # strip: density falls off laterally, gently along the axis
+					return clampf(absf(bz) / maxf(strip_half, 1.0) * 0.72
+							+ absf(bx) / pave_r * 0.30, 0.0, 1.0)
+				2:  # waterfront: gradient from the sea edge (core) to inland (fringe)
+					var s := Vector2(bx, bz).dot(inland2) / pave_r
+					return clampf(0.5 + s * 0.55 + Vector2(bx, bz).length() / pave_r * 0.15, 0.0, 1.0)
+				3:  # plaza: densest ring right at the square, thinning outward
+					return clampf(maxf(Vector2(bx, bz).length() - plaza_open, 0.0) / pave_r, 0.0, 1.0)
+				_:  # radial classic
+					return clampf(Vector2(bx, bz).length() / pave_r, 0.0, 1.0)
+
 		# NO concrete disc — the city's ground is the URBAN TERRAIN the shader paints
 		# (from the per-vertex settlement factor baked into the mesh) plus the dark
 		# street grid and the buildings. The streets are laid straight on that ground.
-		var n := int(pave_r / CELL)
+		var n := int(pave_r / cell)
 		for gi in range(-n, n + 1):
-			var off := float(gi) * CELL
+			var off := float(gi) * cell
 			if absf(off) >= pave_r:
 				continue
 			var half_len : float = sqrt(maxf(pave_r * pave_r - off * off, 0.0))
-			_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, true, up)
-			_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, false, up)
+			if arch == 1:
+				# Strip town: along-axis streets only inside the strip; cross
+				# streets clipped to the strip width.
+				if absf(off) < strip_half:
+					_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, true, up)
+				_emit_street_quad(street_st, pad_point, off, STREET_HALF, minf(half_len, strip_half), false, up)
+			else:
+				_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, true, up)
+				_emit_street_quad(street_st, pad_point, off, STREET_HALF, half_len, false, up)
 			any_street = true
 
 		# Buildings: each block is SUBDIVIDED into a small grid of lots, each with its
@@ -753,17 +853,21 @@ func _build_settlements() -> void:
 		# is warehouses.
 		for bi in range(-n, n):
 			for bj in range(-n, n):
-				var bx := (float(bi) + 0.5) * CELL
-				var bz := (float(bj) + 0.5) * CELL
+				var bx := (float(bi) + 0.5) * cell
+				var bz := (float(bj) + 0.5) * cell
 				var bdist : float = Vector2(bx, bz).length()
-				if bdist > pave_r - CELL * 0.55:
+				if bdist > pave_r - cell * 0.55:
 					continue
+				if arch == 1 and absf(bz) > strip_half:
+					continue   # strip town: nothing beyond the strip's flanks
+				if arch == 3 and bdist < plaza_open:
+					continue   # plaza: the central square stays open
 				if rng.randf() < 0.05:
 					continue   # leave the odd block open for a plaza / park
-				# District factor (0 = core, 1 = fringe) with a little noise so the rings
-				# interlock instead of forming perfect concentric bands.
-				var zt : float = clampf(bdist / pave_r + rng.randf_range(-0.10, 0.10), 0.0, 1.0)
-				var block := CELL - STREET_HALF * 2.0
+				# District factor (0 = core, 1 = fringe), shaped by the archetype, with
+				# a little noise so districts interlock instead of forming hard bands.
+				var zt : float = clampf(zone.call(bx, bz) + rng.randf_range(-0.10, 0.10), 0.0, 1.0)
+				var block := cell - STREET_HALF * 2.0
 				var subx : int
 				var subz : int
 				var fill_lo : float
@@ -774,16 +878,18 @@ func _build_settlements() -> void:
 				var tiered := false
 				var industrial := false
 				if zt < 0.32:
-					# Core: dense small lots, tall tiered towers.
+					# Core: dense small lots, tall tiered towers. `h_mult` varies the
+					# skyline city-to-city; PLAZA cores read civic (taller ring).
 					subx = rng.randi_range(2, 3); subz = rng.randi_range(2, 3)
 					fill_lo = 0.80; fill_hi = 0.95
-					h_lo = 34.0; h_hi = lerp(60.0, 150.0, size_scale)
+					h_lo = 34.0
+					h_hi = lerp(60.0, 150.0, size_scale) * h_mult * (1.2 if arch == 3 else 1.0)
 					vacancy = 0.05; tiered = true
 				elif zt < 0.68:
 					# Residential ring: low/mid-rise, denser.
 					subx = rng.randi_range(2, 3); subz = rng.randi_range(2, 3)
 					fill_lo = 0.66; fill_hi = 0.86
-					h_lo = 8.0; h_hi = lerp(16.0, 34.0, size_scale)
+					h_lo = 8.0; h_hi = lerp(16.0, 34.0, size_scale) * h_mult
 					vacancy = 0.12
 				else:
 					# Industrial / outskirts: big lots, wide low warehouses, sparse.
@@ -802,6 +908,9 @@ func _build_settlements() -> void:
 						var ground : Vector3 = pad_point.call(lox, loz, 0.0)
 						# Skip lots the highway avenue runs through.
 						if _near_segment(ground, hwy_a, hwy_b, 22.0):
+							continue
+						# Keep the airfield corridor (runway + apron) clear.
+						if has_airport and absf(loz - air_oz) < 42.0:
 							continue
 						# Footprint fills most of the lot, leaving a narrow alley.
 						var fx := lotx * rng.randf_range(fill_lo, fill_hi)
@@ -830,6 +939,13 @@ func _build_settlements() -> void:
 										Basis(dir_x * tfx, up * th, dir_z * tfz), top + up * (th * 0.5)))
 								colors.append(_building_color(hy, zt, industrial, rng))
 								top += up * th
+
+		# Enterable outpost (interior system): one building per settlement with a
+		# real walk-in interior, placed at the pavement edge facing the centre.
+		_spawn_interior_outpost(root, pad_point, bitan, up, pave_r, span, ci)
+
+		if has_airport:
+			_build_airfield(root, pad_point, tangent, bitan, up, pave_r, air_oz, ci)
 
 	# City streets — one merged dark mesh across all pads, laid on the urban ground.
 	if any_street:
@@ -968,6 +1084,162 @@ func _build_settlements() -> void:
 	planet.add_child(root)
 
 
+# ── Airfields (airport settlements) ───────────────────────────────────────────
+# A runway strip laid on the carved pad ground (same height-following quads as
+# the streets), centreline markings, two hangars, a control tower, and a parked
+# flyable Aircraft (the godotflight fixed-wing port) at the runway threshold.
+func _build_airfield(parent: Node3D, pad_point: Callable, tangent: Vector3,
+		bitan: Vector3, up: Vector3, pave_r: float, air_oz: float, ci: int) -> void:
+	var half_len : float = sqrt(maxf(pave_r * pave_r - air_oz * air_oz, 0.0)) * 0.95
+	if half_len < 90.0:
+		return
+	const RUNWAY_HALF := 10.0
+	var field := Node3D.new()
+	field.name = "Airfield%d" % ci
+
+	# Runway surface — segmented quads following the ground, slightly above the
+	# street layer so it reads on top.
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var segs := 24
+	var prev_l : Vector3
+	var prev_r : Vector3
+	for i in segs + 1:
+		var ox : float = lerpf(-half_len, half_len, float(i) / float(segs))
+		var lft : Vector3 = pad_point.call(ox, air_oz - RUNWAY_HALF, 0.45)
+		var rgt : Vector3 = pad_point.call(ox, air_oz + RUNWAY_HALF, 0.45)
+		if i > 0:
+			st.set_normal(up); st.add_vertex(prev_l)
+			st.set_normal(up); st.add_vertex(prev_r)
+			st.set_normal(up); st.add_vertex(lft)
+			st.set_normal(up); st.add_vertex(prev_r)
+			st.set_normal(up); st.add_vertex(rgt)
+			st.set_normal(up); st.add_vertex(lft)
+		prev_l = lft
+		prev_r = rgt
+	var rmat := StandardMaterial3D.new()
+	rmat.albedo_color = Color(0.10, 0.10, 0.11)
+	rmat.roughness = 0.95
+	rmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	var rmi := MeshInstance3D.new()
+	rmi.name = "Runway"
+	rmi.mesh = st.commit()
+	rmi.material_override = rmat
+	field.add_child(rmi)
+
+	# Centreline dashes — thin white quads just above the asphalt.
+	var dash_st := SurfaceTool.new()
+	dash_st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var dash_len := 6.0
+	var dash_gap := 10.0
+	var ox_d := -half_len + 20.0
+	while ox_d < half_len - 20.0:
+		var a : Vector3 = pad_point.call(ox_d, air_oz - 0.35, 0.55)
+		var b : Vector3 = pad_point.call(ox_d, air_oz + 0.35, 0.55)
+		var c : Vector3 = pad_point.call(ox_d + dash_len, air_oz + 0.35, 0.55)
+		var d : Vector3 = pad_point.call(ox_d + dash_len, air_oz - 0.35, 0.55)
+		dash_st.set_normal(up); dash_st.add_vertex(a)
+		dash_st.set_normal(up); dash_st.add_vertex(b)
+		dash_st.set_normal(up); dash_st.add_vertex(c)
+		dash_st.set_normal(up); dash_st.add_vertex(a)
+		dash_st.set_normal(up); dash_st.add_vertex(c)
+		dash_st.set_normal(up); dash_st.add_vertex(d)
+		ox_d += dash_len + dash_gap
+	var dmat := StandardMaterial3D.new()
+	dmat.albedo_color = Color(0.92, 0.92, 0.90)
+	dmat.roughness = 0.8
+	dmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	var dmi := MeshInstance3D.new()
+	dmi.name = "RunwayMarkings"
+	dmi.mesh = dash_st.commit()
+	dmi.material_override = dmat
+	field.add_child(dmi)
+
+	# Buildings stand on the apron side (away from town centre = +bitan).
+	# Right-handed surface frame: x = tangent, y = up, z = -bitan.
+	var frame := Basis(tangent, up, -bitan)
+	var hangar_mat := StandardMaterial3D.new()
+	hangar_mat.albedo_color = Color(0.45, 0.47, 0.50)
+	hangar_mat.roughness = 0.6
+	hangar_mat.metallic = 0.4
+	for k in 2:
+		var hx := -50.0 + float(k) * 100.0
+		var hpos : Vector3 = pad_point.call(hx, air_oz + 30.0, 0.0)
+		_airfield_box(field, frame, hpos, up, Vector3(26.0, 9.0, 18.0), hangar_mat)
+	# Control tower: shaft + cab.
+	var tower_mat := StandardMaterial3D.new()
+	tower_mat.albedo_color = Color(0.75, 0.75, 0.78)
+	tower_mat.roughness = 0.5
+	var tpos : Vector3 = pad_point.call(half_len * 0.7, air_oz + 28.0, 0.0)
+	_airfield_box(field, frame, tpos, up, Vector3(5.0, 18.0, 5.0), tower_mat)
+	var cab_mat := StandardMaterial3D.new()
+	cab_mat.albedo_color = Color(0.15, 0.25, 0.32)
+	cab_mat.roughness = 0.2
+	cab_mat.metallic = 0.6
+	_airfield_box(field, frame, tpos + up * 18.0, up, Vector3(8.0, 3.5, 8.0), cab_mat)
+
+	parent.add_child(field)
+	_attach_trimesh_collider(rmi)
+
+	# Parked aircraft at the runway threshold, nose down the strip (+tangent).
+	var craft := Aircraft.new()
+	craft.name = "Aircraft%d" % ci
+	craft.planet = planet
+	var cb := Basis(-bitan, up, -tangent)
+	craft.transform = Transform3D(cb, pad_point.call(-half_len * 0.6, air_oz, 1.6))
+	craft.freeze = true   # parked: ride the planet spin kinematically
+	parent.add_child(craft)
+
+
+# A box with its base at `base_pos`, oriented by the orthonormal surface frame,
+# plus a matching StaticBody3D collider on the environment layer.
+func _airfield_box(parent: Node3D, frame: Basis, base_pos: Vector3, up: Vector3,
+		size: Vector3, mat: Material) -> void:
+	var mi := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = size
+	mi.mesh = bm
+	mi.material_override = mat
+	mi.transform = Transform3D(frame, base_pos + up * (size.y * 0.5 - 0.4))
+	parent.add_child(mi)
+	var body := StaticBody3D.new()
+	body.collision_layer = 1
+	body.collision_mask = 0
+	var cs := CollisionShape3D.new()
+	var bs := BoxShape3D.new()
+	bs.size = size
+	cs.shape = bs
+	body.add_child(cs)
+	mi.add_child(body)
+
+
+# ── Enterable outposts (interior system) ──────────────────────────────────────
+# Builds a small structure with a real interior from the ported InteriorLayout /
+# InteriorGenerator classes: visual wall/floor boxes plus a layer-1 StaticBody3D
+# so the WALK-mode player can step inside through the open front wall. Layout
+# variant cycles per settlement (single room / two rooms / corridor / L-shape).
+func _spawn_interior_outpost(parent: Node3D, pad_point: Callable, bitan: Vector3,
+		up: Vector3, pave_r: float, span: float, ci: int) -> void:
+	# Sit just outside the paved disc but inside the sampled height grid.
+	var d := minf(pave_r * 1.04, span * 0.96)
+	var ground : Vector3 = pad_point.call(0.0, d, 0.0)
+	var layout : InteriorLayout = InteriorLayout.create_from_type(ci % 4, 1.0)
+
+	var outpost := Node3D.new()
+	outpost.name = "Outpost%d" % ci
+	# Layout frame: Y up, entrance toward local +Z. Face the entrance back
+	# toward the town centre (-bitan) so it opens onto the pavement.
+	var z_dir := -bitan
+	var x_dir := up.cross(z_dir).normalized()
+	z_dir = x_dir.cross(up).normalized()
+	# Room boxes are centred on the node origin vertically (height 3 m), so
+	# lift by half the height minus a small embed against slope gaps.
+	outpost.transform = Transform3D(Basis(x_dir, up, z_dir), ground + up * (1.5 - 0.25))
+	InteriorGenerator.generate_visuals(layout, outpost)
+	outpost.add_child(InteriorGenerator.generate_static_body(layout))
+	parent.add_child(outpost)
+
+
 # Rivers/streams — water ribbons laid in the channels the global erosion field
 # carved (see rust/src/erosion.rs). The native side traces each course downhill
 # from a highland source to the sea and returns floor points already at the exact
@@ -993,6 +1265,7 @@ func _build_rivers() -> void:
 		if count >= 2:
 			var prev_l := Vector3.ZERO
 			var prev_r := Vector3.ZERO
+			var prev_col := Color.WHITE
 			var has_prev := false
 			for i in count:
 				var cp := points[base + i]
@@ -1005,23 +1278,34 @@ func _build_rivers() -> void:
 				if travel.length() < 1e-4:
 					has_prev = false
 					continue
+				# Rapids / waterfalls: where the course drops steeply between
+				# neighbouring points, the water whitens into foam (vertex colour;
+				# the material multiplies it over the water tint). Steepness =
+				# radial drop over surface run between the draped points.
+				var drop : float = behind.length() - ahead.length()
+				var run : float = maxf(travel.length(), 0.5)
+				var steep : float = clampf(drop / run, 0.0, 1.0)
+				var foam : float = smoothstep(0.25, 0.7, steep)
+				var col := Color(0.17, 0.40, 0.60, 0.74).lerp(Color(0.88, 0.93, 0.96, 0.92), foam)
 				travel = travel.normalized()
 				var nrm := up.cross(travel).normalized()
-				# Widen downstream with flow; sit just above the channel floor.
+				# Widen downstream with flow; sit just above the channel floor
+				# (a touch higher where it foams, so rapids read over the rock).
 				var half : float = lerp(4.0, 24.0, widths[base + i])
-				var center := cp + up * 2.0
+				var center := cp + up * (2.0 + foam * 1.2)
 				var lft := center + nrm * half
 				var rgt := center - nrm * half
 				if has_prev:
-					st.set_normal(up); st.add_vertex(prev_l)
-					st.set_normal(up); st.add_vertex(prev_r)
-					st.set_normal(up); st.add_vertex(lft)
-					st.set_normal(up); st.add_vertex(prev_r)
-					st.set_normal(up); st.add_vertex(rgt)
-					st.set_normal(up); st.add_vertex(lft)
+					st.set_color(prev_col); st.set_normal(up); st.add_vertex(prev_l)
+					st.set_color(prev_col); st.set_normal(up); st.add_vertex(prev_r)
+					st.set_color(col); st.set_normal(up); st.add_vertex(lft)
+					st.set_color(prev_col); st.set_normal(up); st.add_vertex(prev_r)
+					st.set_color(col); st.set_normal(up); st.add_vertex(rgt)
+					st.set_color(col); st.set_normal(up); st.add_vertex(lft)
 					any = true
 				prev_l = lft
 				prev_r = rgt
+				prev_col = col
 				has_prev = true
 		base += count
 
@@ -1044,14 +1328,15 @@ func _build_rivers() -> void:
 		var bt := up.cross(t).normalized()
 		var segs := 28
 		var hub := c + up * 0.4
+		var lake_col := Color(0.15, 0.38, 0.58, 0.78)
 		for s in segs:
 			var a0 := TAU * float(s) / float(segs)
 			var a1 := TAU * float(s + 1) / float(segs)
 			var p0 := (c + (t * cos(a0) + bt * sin(a0)) * rad).normalized() * surf_r + up * 0.4
 			var p1 := (c + (t * cos(a1) + bt * sin(a1)) * rad).normalized() * surf_r + up * 0.4
-			st.set_normal(up); st.add_vertex(hub)
-			st.set_normal(up); st.add_vertex(p1)
-			st.set_normal(up); st.add_vertex(p0)
+			st.set_color(lake_col); st.set_normal(up); st.add_vertex(hub)
+			st.set_color(lake_col); st.set_normal(up); st.add_vertex(p1)
+			st.set_color(lake_col); st.set_normal(up); st.add_vertex(p0)
 		any = true
 
 	if not any:
@@ -1061,7 +1346,9 @@ func _build_rivers() -> void:
 	rmi.name = "RiversAndLakes"
 	rmi.mesh = rmesh
 	var rmat := StandardMaterial3D.new()
-	rmat.albedo_color = Color(0.17, 0.40, 0.60, 0.74)
+	# Colour (incl. the foam whitening on rapids/waterfalls) is per-vertex now.
+	rmat.albedo_color = Color.WHITE
+	rmat.vertex_color_use_as_albedo = true
 	rmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	rmat.roughness = 0.12
 	rmat.metallic = 0.0
@@ -1162,31 +1449,37 @@ func _add_landmark_box(st: SurfaceTool, center: Vector3, up: Vector3,
 # point on the flat pad sphere (the closure built per pad in _build_settlements).
 func _emit_street_quad(st: SurfaceTool, pad_point: Callable, off: float,
 		half_w: float, half_len: float, along_bitan: bool, up: Vector3) -> void:
-	# Just above the pavement so the grid reads as a road surface without floating
-	# (3.2 floated off the near-flat pad now that the pad barely undulates).
-	var lift := 1.6
-	var a : Vector3
-	var b : Vector3
-	var c : Vector3
-	var d : Vector3
-	if along_bitan:
-		# Runs along bitan (oz); width in tangent (ox) around `off`.
-		a = pad_point.call(off - half_w, -half_len, lift)
-		b = pad_point.call(off + half_w, -half_len, lift)
-		c = pad_point.call(off + half_w,  half_len, lift)
-		d = pad_point.call(off - half_w,  half_len, lift)
-	else:
-		# Runs along tangent (ox); width in bitan (oz) around `off`.
-		a = pad_point.call(-half_len, off - half_w, lift)
-		b = pad_point.call( half_len, off - half_w, lift)
-		c = pad_point.call( half_len, off + half_w, lift)
-		d = pad_point.call(-half_len, off + half_w, lift)
-	st.set_normal(up); st.add_vertex(a)
-	st.set_normal(up); st.add_vertex(b)
-	st.set_normal(up); st.add_vertex(c)
-	st.set_normal(up); st.add_vertex(a)
-	st.set_normal(up); st.add_vertex(c)
-	st.set_normal(up); st.add_vertex(d)
+	# Just above the pavement so the grid reads as a road surface without floating.
+	var lift := 0.9
+	# SUBDIVIDED along the length: a single quad across the pad is a straight
+	# CHORD, and over a ~500 m pad on a 24 km sphere the chord sags ~1.4 m below
+	# the (now exactly spherical) flat pad — streets were buried mid-span and
+	# floated at the ends. Short segments draped per-vertex follow the curvature.
+	const SEG_LEN := 32.0
+	var segs : int = maxi(int(ceil(half_len * 2.0 / SEG_LEN)), 1)
+	var prev_a : Vector3
+	var prev_b : Vector3
+	for si in segs + 1:
+		var l := -half_len + half_len * 2.0 * float(si) / float(segs)
+		var a : Vector3
+		var b : Vector3
+		if along_bitan:
+			# Runs along bitan (oz); width in tangent (ox) around `off`.
+			a = pad_point.call(off - half_w, l, lift)
+			b = pad_point.call(off + half_w, l, lift)
+		else:
+			# Runs along tangent (ox); width in bitan (oz) around `off`.
+			a = pad_point.call(l, off - half_w, lift)
+			b = pad_point.call(l, off + half_w, lift)
+		if si > 0:
+			st.set_normal(up); st.add_vertex(prev_a)
+			st.set_normal(up); st.add_vertex(prev_b)
+			st.set_normal(up); st.add_vertex(b)
+			st.set_normal(up); st.add_vertex(prev_a)
+			st.set_normal(up); st.add_vertex(b)
+			st.set_normal(up); st.add_vertex(a)
+		prev_a = a
+		prev_b = b
 
 
 # Power lines along the highways: a pole every few road samples (offset to the
